@@ -2,15 +2,18 @@
 
 An unofficial Windows theming tool for WorkBuddy. It injects CSS through local loopback CDP at `127.0.0.1:9342`. It does not modify WorkBuddy's `app.asar`, executables, signatures, or installation files.
 
-This project is not affiliated with, endorsed by, or sponsored by WorkBuddy, CodeBuddy, or Tencent. It is derived from [HeiGeAi/heige-codex-skin-studio](https://github.com/HeiGeAi/heige-codex-skin-studio) and preserves the upstream MIT license and attribution.
+This project is not affiliated with, endorsed by, or sponsored by WorkBuddy, CodeBuddy, or Tencent. It is a **derived work** based on [HeiGeAi/heige-codex-skin-studio](https://github.com/HeiGeAi/heige-codex-skin-studio) (MIT License, baseline 5.5.18) and preserves the upstream copyright and license text. The full list of changes is in [DERIVED_WORK.md](DERIVED_WORK.md).
+
+[中文 README](README.md) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [Derived work](DERIVED_WORK.md) · [Security](SECURITY.md)
 
 ## Important boundaries
 
 - WorkBuddy uses **9342 only**. Port **9341 belongs to ChatGPT/Codex** and is never managed by this project.
 - Applying the skin for the first time restarts WorkBuddy. Save your work first.
-- After persistence is enabled, skin restoration can take about **30–45 seconds** after you manually start WorkBuddy.
-- Manually exiting WorkBuddy keeps it closed. The keep-alive task revives only the controller, not the application.
+- Port and skin both need to settle: 9342 in about **25–30 seconds**, the skin in about **30–45 seconds**. Do not relaunch repeatedly while waiting.
+- Electron's single-instance lock means **only the first process can bind 9342**. How you start WorkBuddy therefore decides whether the skin works at all — see “Startup mode” below.
 - Background tasks use `conhost.exe --headless` and should not open Windows Terminal.
+- Every `*.bat` closes itself on success (5–14 second countdown, any key closes immediately) and only stays open on failure. Set `HEIGE_NO_PAUSE=1` for fully silent runs.
 
 ## Beginner workflow
 
@@ -18,11 +21,30 @@ This project is not affiliated with, endorsed by, or sponsored by WorkBuddy, Cod
 2. Save ongoing WorkBuddy work and run `scripts\windows\install.bat`.
 3. Run `scripts\windows\apply-theme.bat` to apply the bundled copyright-safe placeholder.
 4. Run `scripts\windows\enable-persistence.bat`, then enable “skin persistence” in WorkBuddy's injected Theme Center. The in-app confirmation is a security boundary and is intentionally not bypassed by the script.
-5. Run `diagnose.bat`. Check that 9342 is listening, the controller is headless, PT1M keep-alive is present, and `CodexPortTouched` is False.
-6. If the skin is missing, wait 45 seconds. Fully exit WorkBuddy, including its tray process, before retrying. Never switch the project to 9341.
-7. Run `restore-official.bat` to disable persistence and reopen the official UI.
-8. Run `disable-persistence.bat` to keep the current session skinned but return to native UI on the next start.
-9. Run `uninstall.bat` to remove project tasks, state, user themes, and the installed project copy. WorkBuddy itself is not removed.
+5. Run `scripts\windows\setup-startup.bat` and pick a startup mode (see below).
+6. Run `diagnose.bat`. It now prints a verdict; the key line is `Port9342OwnerIsWorkBuddy : True`.
+7. If the skin is missing, wait 45 seconds. Fully exit WorkBuddy, including its tray process, before retrying. Never switch the project to 9341.
+8. Run `restore-official.bat` to disable persistence and reopen the official UI.
+9. Run `disable-persistence.bat` to keep the current session skinned but return to native UI on the next start.
+10. Run `uninstall.bat` to remove project tasks, state, user themes, and the installed project copy. WorkBuddy itself is not removed.
+
+## Startup mode
+
+`setup-startup.bat` decides whether WorkBuddy may appear on its own.
+
+| Mode | Behavior | For whom |
+| --- | --- | --- |
+| `1 Manual` (recommended) | Starts only when you click the icon, and the skin is there from the first frame. Exiting really exits. | Anyone who dislikes background tasks relaunching the app |
+| `2 Auto` | A session task relaunches a port-enabled instance after exit, so the skin appears on login. | Anyone who wants the skin without clicking anything |
+| `3 Restore` | Undoes every change this script made. | Uninstalling the startup customization |
+
+`Manual` writes `WORKBUDDY_REMOTE_DEBUGGING_PORT=9342` as a **user-level environment variable**, so the first process from any entry point carries the port, and turns off the Windows 11 “restart apps after sign-in” behavior that otherwise spawns a port-less instance first. Add `-UseShortcut` to rewrite desktop/Start-menu/taskbar shortcuts instead of touching the environment.
+
+Why this matters: Windows 11 may relaunch WorkBuddy at sign-in **without** the debug port. The single-instance lock then blocks the session task from launching a second, port-enabled instance, so the skin can lag up to a minute. Turning that behavior off removes the race entirely.
+
+## Troubleshooting
+
+See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for symptom → cause → fix across 11 real-world failures, including missing skin, delayed skin after login, black console flashes, a closed console taking WorkBuddy down with it, and how to read scheduled-task result codes (`0x800710E0`, `0x41301`, `0x41306`).
 
 ## Supported baseline
 

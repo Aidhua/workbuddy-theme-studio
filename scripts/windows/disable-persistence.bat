@@ -1,5 +1,16 @@
 @echo off
 setlocal
+REM ASCII-only on purpose: all Chinese output comes from PowerShell as UTF-8.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0disable-persistence.ps1"
-if errorlevel 1 pause & exit /b 1
-pause
+set "HEIGE_EXIT=%ERRORLEVEL%"
+echo.
+if not "%HEIGE_EXIT%"=="0" (
+  echo [FAILED] exit code %HEIGE_EXIT%. Read the messages above.
+  if /I not "%HEIGE_NO_PAUSE%"=="1" pause
+  exit /b %HEIGE_EXIT%
+)
+echo [OK] Persistence is off.
+echo      This window keeps the skin; the next launch shows the official look.
+echo      Closing in 5 seconds, or press any key to close now.
+if /I not "%HEIGE_NO_PAUSE%"=="1" timeout /t 5
+exit /b 0

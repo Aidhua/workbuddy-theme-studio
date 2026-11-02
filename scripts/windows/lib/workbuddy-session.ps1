@@ -40,9 +40,17 @@ function Start-HeiGeWorkBuddyScheduledSession {
     $principal = New-ScheduledTaskPrincipal -UserId $userName -LogonType Interactive `
         -RunLevel Limited
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
-        -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
+        -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew `
+        -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
+    # 只注册不挂触发器的话，重启后会话任务不会自启，Auto 模式就等于失效。
+    # 与控制器任务保持同一套：登录触发 + Once/PT1M 保活，IgnoreNew 防止并发。
+    $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $userName
+    $keepAliveTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(-1) `
+        -RepetitionInterval (New-TimeSpan -Minutes 1) `
+        -RepetitionDuration (New-TimeSpan -Days 3650)
     Register-ScheduledTask -TaskName $script:HeiGeWorkBuddySessionTaskName `
-        -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+        -Action $action -Principal $principal -Settings $settings `
+        -Trigger @($logonTrigger, $keepAliveTrigger) -Force | Out-Null
     Start-ScheduledTask -TaskName $script:HeiGeWorkBuddySessionTaskName
     return [pscustomobject][ordered]@{
         Pid = 0

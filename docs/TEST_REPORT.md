@@ -45,3 +45,21 @@
 ## 发布门槛建议
 
 公开 Release 前，应在一次性 Windows 测试账户或虚拟机中按 README 完成安装、应用、持久化、三轮重启、故障注入、恢复和卸载，并把新结果追加到本文件。不要在维护者的正式 WorkBuddy/ChatGPT 环境中做这组测试。
+
+## 0.2.0 本地自检（2026-11-02）
+
+发布前在维护者机器上做了只读与离线部分的验证：
+
+| 项 | 命令 | 结果 |
+| --- | --- | --- |
+| 单元测试 | `node --test` | 5/5 通过，含「CLI 只接受 9342、不碰 9341」断言 |
+| 发布扫描 | `node scripts/audit-release.mjs` | 无隐私路径、无令牌、无二进制泄漏；唯一提示为工作树内存在 `.git`，属预期 |
+| 语法校验 | `Parser::ParseFile` | `setup-startup.ps1`、`diagnose.ps1`、`lib\workbuddy-session.ps1` 均 parse OK |
+| 诊断实跑 | `diagnose.ps1` | 通过，输出「链路正常：9342 由 WorkBuddy 自己持有」，并正确识别 `SessionTaskLastResult` 的 `0x41306` |
+
+**未验证部分（必须承认）**：`setup-startup.ps1` 的三种模式会修改用户级环境变量、注册表开关和计划任务，出于安全考虑没有在维护者的正式环境中执行，只做了语法与逻辑走查。三种模式的真机验收应在一次性 Windows 账户或虚拟机中完成，重点是：
+
+1. Manual 模式下重启一次，确认「开机不自动出现 + 点图标即带皮肤」。
+2. Auto 模式下退出 WorkBuddy，确认会话任务在 60 秒内拉回带端口的实例。
+3. Restore 模式下确认环境变量、快捷方式与 `RestartApps` 全部回到首次运行前的基线。
+
