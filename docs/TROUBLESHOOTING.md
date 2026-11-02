@@ -19,6 +19,20 @@
 | `True` 且 `Port9342OwnerIsWorkBuddy : True` | 通道正常，问题在样式层 | 运行 `apply-theme.bat` 重放主题；确认选中的主题不是「官方」 |
 | `True` 且 `Port9342OwnerIsWorkBuddy : False` | 9342 被别的程序占了 | 退出那个程序。不要改用 9341 |
 
+### 1.1 install 或 apply 报「ephemeral controller 未确认皮肤已应用」
+
+**症状**：脚本反复打印「仍在等待皮肤生效… x/160」约 40 秒后失败；手动跑
+
+```
+node "%USERPROFILE%\.workbuddy\heige-codex-skin-studio\src\cli.mjs" controller --ephemeral --port 9342 --app workbuddy
+```
+
+输出 `unexpected package identity`。
+
+**原因**：`package.json` 的 `name` 被改动过。注入子进程启动时校验包身份，`name` 必须是 `heige-codex-skin-studio`（`src/update-check.mjs` 硬编码），否则子进程启动即退出，而它的报错被丢弃，外层只能看到等待超时。
+
+**做法**：恢复 `name` 字段为 `heige-codex-skin-studio`（版本号可以随意），重新运行 `apply-theme.bat`。GitHub 仓库名与包名无关，改名仓库不需要改包名。
+
 ---
 
 ## 2. 开机后没有皮肤，过一会儿才出现

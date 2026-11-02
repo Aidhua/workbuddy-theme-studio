@@ -1,6 +1,6 @@
 {
-  "name": "workbuddy-theme-studio",
-  "version": "0.2.0",
+  "name": "heige-codex-skin-studio",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "engines": { "node": ">=22" },
