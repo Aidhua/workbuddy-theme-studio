@@ -11,8 +11,9 @@
 1. 安装 Node.js 22+。
 2. 双击 `scripts\windows\install.bat`（会自动重启一次 WorkBuddy）。
 3. 双击 `scripts\windows\apply-theme.bat`。
-4. 双击 `scripts\windows\setup-startup.bat`，按 `1`（手动启动：点图标才有，点开就有皮肤）。
-5. 打开 WorkBuddy，进任意**会话**（不是首页），等最多 45 秒。
+4. 双击 `scripts\windows\enable-persistence.bat`，然后回 WorkBuddy 顶部「主题」中心，**亲手打开「皮肤常驻」开关**。
+5. **最后**双击 `scripts\windows\setup-startup.bat`，按 `1`（手动启动：点图标才有，点开就有皮肤）。`setup-startup` 必须放在 `enable-persistence` 之后，否则后者点亮的「退出后自动拉回」会话任务不会被禁用（详见下方「启动方式」）。
+6. 打开 WorkBuddy，进任意**会话**（不是首页），等最多 45 秒。
 
 任何一步失败，窗口会停住并打印 `[FAILED]`；成功后会自动关闭。看不懂就双击 `scripts\windows\diagnose.bat`，它会直接告诉你下一步该点哪个。
 
@@ -100,6 +101,8 @@ WorkBuddy 顶部出现「主题」入口后，可在主题中心切换主题或�
 - `PersistenceHeadless : True`
 - `KeepAlivePT1M : True`
 - `CodexPortTouched : False`
+
+> 以上 `PersistenceTask / KeepAlivePT1M` 为**自动模式**的预期。若你选了 **1 手动模式**，`setup-startup` 会禁用会话任务，此时 `PersistenceTask` 显示 `Disabled`、且 `KeepAlivePT1M` 不再成立——这是正常的，代表「退出后不会被拉回」。无论哪种模式，`Port9342OwnerIsWorkBuddy : True` 都是健康标志。
 
 然后彻底退出 WorkBuddy，再手动双击官方 `WorkBuddy.exe`。9342 通常约 25～30 秒恢复，皮肤约 30～45 秒恢复。
 
