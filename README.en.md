@@ -1,4 +1,4 @@
-# WorkBuddy Loopback Skin
+# WorkBuddy Theme Studio
 
 An unofficial Windows theming tool for WorkBuddy. It injects CSS through local loopback CDP at `127.0.0.1:9342`. It does not modify WorkBuddy's `app.asar`, executables, signatures, or installation files.
 

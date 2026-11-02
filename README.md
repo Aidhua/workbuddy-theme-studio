@@ -1,4 +1,4 @@
-# WorkBuddy Loopback Skin
+# WorkBuddy Theme Studio
 
 给 Windows 版 WorkBuddy 更换本地主题的非官方开源工具。它只通过本机回环 `127.0.0.1:9342` 使用 CDP 注入 CSS，不修改 WorkBuddy 的 `app.asar`、程序、签名或官方安装文件。
 
