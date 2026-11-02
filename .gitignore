@@ -1,0 +1,15 @@
+node_modules/
+.git/
+.workbuddy/
+output/
+*.log
+*.tmp
+*.bak
+state.json
+session.json
+transition.json
+controller-start-request.json
+controller-handshake.json
+.env
+.env.*
+!.env.example

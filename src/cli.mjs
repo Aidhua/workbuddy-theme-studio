@@ -1,0 +1,3331 @@
+#!/usr/bin/env node
+import { execFile as execFileCallback, spawn } from "node:child_process";
+import { randomBytes, randomUUID } from "node:crypto";
+import { readFileSync, realpathSync } from "node:fs";
+import { dirname, isAbsolute, join, normalize, posix, relative, resolve, win32 } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { promisify } from "node:util";
+
+import {
+  claimBackgroundStartRequest,
+  consumeBackgroundHandshake,
+  publishBackgroundHandshake,
+  publishBackgroundStartRequest,
+  removeBackgroundHandshake,
+  removeBackgroundStartRequest,
+  removeLegacyBackgroundStartRequest,
+  waitForBackgroundHandshake,
+} from "./background-handshake.mjs";
+import {
+  classifyInjection,
+  discoverCodex,
+  listCodexProcesses,
+  parseCodexProcessTable,
+  resolveCodexApp,
+  runtimeDiagnostics,
+  sameProcessIdentity,
+} from "./codex-app.mjs";
+import {
+  DEFAULT_CDP_PORT,
+  DEFAULT_THEME_ID,
+  NATIVE_THEME_ID,
+  resolveStudioPaths,
+} from "./constants.mjs";
+import { createSkinController } from "./controller.mjs";
+import {
+  applySkin,
+  deliverThemeSelectionResult,
+  deliverUpdateCheckResult,
+  removeSkin,
+  skinStatus,
+} from "./injector.mjs";
+import {
+  spawnDetachedLifecycle,
+  writeLifecycleActionFile,
+} from "./lifecycle-helper.mjs";
+import {
+  CONTROLLER_LAUNCH_AGENT_LABEL,
+  finalizeLegacyWatchdogMigration,
+  inspectLaunchAgent,
+  inspectLaunchAgentProcessIdentity,
+  migrateLegacyWatchdog,
+  recoverLegacyWatchdogMigration,
+  registerControllerAgent,
+  rollbackLegacyWatchdogMigration,
+  unregisterControllerAgent,
+  wakeControllerAgent,
+} from "./macos-launch-agent.mjs";
+import { ensureLauncherOperationLock as ensureMacosLauncherOperationLock } from "./macos-launcher-recovery.mjs";
+import {
+  macosInstallJournalPath,
+  readMacosInstallJournal,
+} from "./macos-install-journal.mjs";
+import {
+  clearLegacyMigrationCoordinator,
+  createLegacyMigrationCoordinator,
+  legacyMigrationJournalPath,
+  readLegacyMigrationCoordinator,
+  updateLegacyMigrationCoordinator,
+} from "./legacy-migration-coordinator.mjs";
+import { acquireOperationLock, withOperationLock } from "./operation-lock.mjs";
+import { installPet } from "./pet-installer.mjs";
+import {
+  createCachedUpdateChecker,
+  readCurrentPackageVersion,
+} from "./update-check.mjs";
+import {
+  compareAndUpdateStudioState,
+  createDefaultStudioState,
+  migrateLegacyState,
+  readTransitionJournal,
+  readStudioState,
+  recoverStateTransition,
+  rollbackLegacyStateMigration,
+  writeSessionState,
+  writeStudioState,
+} from "./state-store.mjs";
+import { createStudioLogger } from "./studio-logger.mjs";
+import { buildLauncherPanelState } from "./launcher-panel-state.mjs";
+import { loadTheme } from "./theme-schema.mjs";
+import {
+  createSingleImageTheme,
+  createSingleImageThemeFromBytes,
+  listThemes,
+  removeUserTheme as removeUserThemeFromStore,
+  resolveAndLoadTheme,
+} from "./theme-store.mjs";
+import { DEFAULT_PRODUCT_ID, isProductId, PRODUCT_IDS, productProfile } from "./products.mjs";
+import {
+  classifyWindowsPreflightSnapshot,
+  queryWindowsLoopbackExempt,
+  queryWindowsRuntimeSnapshot,
+  validateWindowsRuntimeSnapshot,
+} from "./windows-runtime.mjs";
+import {
+  isolatedWindowsPowerShellEnvironment,
+  trustedWindowsPowerShellPath,
+} from "./windows-secure-fs.mjs";
+
+const execFile = promisify(execFileCallback);
+const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+const BOOLEAN_FLAGS = new Set([
+  "background",
+  "ephemeral",
+  "install-authorization-stdin",
+  "once",
+  "prefer-stored",
+  "restart",
+]);
+const COMMAND_OPTIONS = new Map([
+  ["help", new Set()],
+  // list / create 只碰主题目录不碰宿主进程，但用户主题目录按产品隔离，
+  // 所以同样收 --app（HEIGE_SKIN_APP 环境变量本来就对所有命令生效，白名单不该更窄）
+  ["list", new Set(["app"])],
+  ["create", new Set(["image", "name", "app"])],
+  ["customize", new Set(["image", "name", "port", "app"])],
+  ["apply", new Set(["port", "prefer-stored", "restart", "theme", "app"])],
+  ["launcher-apply", new Set(["launcher-version", "port", "theme", "app"])],
+  ["launcher-close", new Set(["launcher-version", "port", "app"])],
+  ["launcher-repair", new Set(["launcher-version", "port", "app"])],
+  ["launcher-state", new Set(["app"])],
+  ["enable-skin", new Set(["port", "theme", "app"])],
+  ["set-persistence", new Set(["app", "install-authorization-stdin", "port", "revision"])],
+  ["pause", new Set(["port", "app"])],
+  ["resume", new Set(["port", "app"])],
+  ["restore", new Set(["port", "app"])],
+  ["controller", new Set([
+    "app",
+    "background",
+    "ephemeral",
+    "once",
+    "platform",
+    "port",
+    "state-directory",
+    "task-name",
+  ])],
+  ["status", new Set(["port", "app"])],
+  ["doctor", new Set(["port", "app"])],
+  ["install-pet", new Set(["source"])],
+]);
+const WINDOWS_PRODUCTION_TASK = "HeiGe Codex Skin Studio Controller";
+const WINDOWS_WORKBUDDY_PRODUCTION_TASK = "HeiGe WorkBuddy Skin Studio Controller";
+const WINDOWS_TEST_TASK = /^HeiGe Codex Skin Studio Test [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const WORKBUDDY_PUBLIC_COMMANDS = new Set([
+  "help", "list", "create", "customize", "apply", "enable-skin",
+  "set-persistence", "pause", "resume", "restore", "controller", "status", "doctor",
+]);
+
+function parseInvocation(argv) {
+  const command = argv[0] ?? "help";
+  const args = {};
+  const positionals = [];
+  for (let index = 1; index < argv.length; index += 1) {
+    const key = argv[index];
+    if (!key.startsWith("--")) {
+      positionals.push(key);
+      continue;
+    }
+    const name = key.slice(2);
+    if (Object.hasOwn(args, name)) throw new Error(`重复参数：--${name}`);
+    if (BOOLEAN_FLAGS.has(name)) {
+      args[name] = true;
+      continue;
+    }
+    const value = argv[index + 1];
+    if (!value || value.startsWith("--")) throw new Error(`${key} 缺少值`);
+    args[name] = value;
+    index += 1;
+  }
+  const allowed = COMMAND_OPTIONS.get(command);
+  if (allowed !== undefined) {
+    for (const name of Object.keys(args)) {
+      if (!allowed.has(name)) throw new Error(`无法识别的参数：--${name}`);
+    }
+    if (command === "set-persistence") {
+      if (positionals.length !== 1) throw new Error("set-persistence 需要且只能提供 true 或 false");
+    } else if (positionals.length !== 0) {
+      throw new Error(`无法识别的参数：${positionals[0]}`);
+    }
+  }
+  return { args, command, positionals };
+}
+
+function assertNodeVersion(value) {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(String(value));
+  if (!match || Number(match[1]) < 22) {
+    throw new Error(`运行命令需要 Node.js 22 或更高版本，实际为 ${String(value)}`);
+  }
+}
+
+function controllerPlatform(value) {
+  const selected = value ?? process.platform;
+  if (selected === "windows") return "win32";
+  if (selected === "win32" || selected === "darwin") return selected;
+  throw new Error("controller --platform 只支持 darwin 或 windows");
+}
+
+function windowsProductionTask(product = DEFAULT_PRODUCT_ID) {
+  return product === "workbuddy" ? WINDOWS_WORKBUDDY_PRODUCTION_TASK : WINDOWS_PRODUCTION_TASK;
+}
+
+function controllerBackgroundIdentity(platform, taskName, product = DEFAULT_PRODUCT_ID) {
+  if (platform === "darwin") {
+    if (taskName !== undefined && taskName !== CONTROLLER_LAUNCH_AGENT_LABEL) {
+      throw new Error("macOS controller 不接受 Windows TaskName");
+    }
+    return CONTROLLER_LAUNCH_AGENT_LABEL;
+  }
+  const productionTask = windowsProductionTask(product);
+  if (taskName === undefined) return productionTask;
+  if (
+    taskName !== productionTask &&
+    (typeof taskName !== "string" || !WINDOWS_TEST_TASK.test(taskName))
+  ) {
+    throw new Error("Windows controller TaskName 不在允许范围内");
+  }
+  return taskName;
+}
+
+function pathsAtStateRoot(base, stateRoot) {
+  return {
+    ...base,
+    stateRoot,
+    statePath: join(stateRoot, "state.json"),
+    sessionPath: join(stateRoot, "session.json"),
+    transitionPath: join(stateRoot, "transition.json"),
+    lockPath: join(stateRoot, "operation.lock"),
+    logPath: join(stateRoot, "injector.log"),
+    userThemesRoot: join(stateRoot, "themes"),
+  };
+}
+
+function controllerPaths({ platform, stateDirectory, taskName, product = undefined }) {
+  // 常驻/临时 controller 的状态根必须跟着产品走，否则 WorkBuddy 的 controller
+  // 会去抢 Codex 的单例锁，表现成「已在运行」直接空转返回，皮肤一行都不注入
+  const base = resolveStudioPaths({ platform, product });
+  if (stateDirectory === undefined) {
+    if (platform === "win32" && typeof taskName === "string" && WINDOWS_TEST_TASK.test(taskName)) {
+      throw new Error("Windows 隔离测试任务必须提供 --state-directory");
+    }
+    return base;
+  }
+  if (platform !== "win32") throw new Error("--state-directory 仅支持 Windows controller");
+  if (
+    typeof stateDirectory !== "string" ||
+    !isAbsolute(stateDirectory) ||
+    normalize(stateDirectory) !== stateDirectory ||
+    stateDirectory.includes("\0")
+  ) {
+    throw new Error("--state-directory 必须是规范绝对路径");
+  }
+  const selected = resolve(stateDirectory);
+  const production = resolve(base.stateRoot);
+  if (taskName === windowsProductionTask(product) && selected.toLowerCase() !== production.toLowerCase()) {
+    throw new Error("Windows 生产任务只能使用默认 APPDATA 状态目录");
+  }
+  if (typeof taskName === "string" && WINDOWS_TEST_TASK.test(taskName) &&
+      selected.toLowerCase() === production.toLowerCase()) {
+    throw new Error("Windows 隔离测试任务不得使用生产状态目录");
+  }
+  return pathsAtStateRoot(base, selected);
+}
+
+function windowsCliTestContext(platform, env = process.env) {
+  const keys = [
+    "HEIGE_TEST_WINDOWS_RUNTIME_FIXTURE",
+    "HEIGE_TEST_WINDOWS_STATE_ROOT",
+    "HEIGE_TEST_WINDOWS_TASK_NAME",
+  ];
+  const present = keys.filter((key) => env[key] !== undefined);
+  if (present.length === 0) return null;
+  if (platform !== "win32" || env.NODE_ENV !== "test" || present.length !== keys.length) {
+    throw new Error("Windows CLI test context requires win32, NODE_ENV=test, and all HEIGE_TEST fields");
+  }
+  const taskName = env.HEIGE_TEST_WINDOWS_TASK_NAME;
+  if (!WINDOWS_TEST_TASK.test(taskName)) {
+    throw new Error("Windows CLI test task name must contain an exact isolated GUID");
+  }
+  const paths = controllerPaths({
+    platform,
+    stateDirectory: env.HEIGE_TEST_WINDOWS_STATE_ROOT,
+    taskName,
+  });
+  return Object.freeze({ paths, taskName });
+}
+
+function productFrom(value, env = process.env) {
+  const selected = value ?? env.HEIGE_SKIN_APP;
+  if (selected === undefined || selected === null || selected === "") return "workbuddy";
+  if (!isProductId(selected)) {
+    throw new Error(`--app 只能是 ${PRODUCT_IDS.join(" 或 ")}`);
+  }
+  if (selected !== "workbuddy") {
+    throw new Error("此发行版只允许 WorkBuddy；不会操作 ChatGPT/Codex 或端口 9341");
+  }
+  return selected;
+}
+
+function portFrom(value, defaultPort = DEFAULT_CDP_PORT) {
+  const port = value === undefined ? defaultPort : Number(value);
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+    throw new Error("--port 必须是 1024 到 65535 的整数");
+  }
+  return port;
+}
+
+function revisionFrom(value, current) {
+  if (value === undefined) return current;
+  const revision = Number(value);
+  if (!Number.isSafeInteger(revision) || revision < 0) {
+    throw new Error("--revision 必须是非负安全整数");
+  }
+  return revision;
+}
+
+function exactBoolean(value) {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  throw new Error("set-persistence 只接受精确的 true 或 false");
+}
+
+function publicProcess(value) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    !Number.isSafeInteger(value.pid) ||
+    value.pid <= 0 ||
+    typeof value.executablePath !== "string" ||
+    value.executablePath.length === 0 ||
+    typeof value.startedAt !== "string" ||
+    value.startedAt.length === 0
+  ) {
+    throw new Error("Codex 进程身份无效");
+  }
+  return {
+    pid: value.pid,
+    executablePath: value.executablePath,
+    startedAt: value.startedAt,
+  };
+}
+
+export async function readProcessIdentity(pid, platform = process.platform) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("进程 PID 无效");
+  if (platform === "win32") {
+    const powershell = trustedWindowsPowerShellPath();
+    try {
+      const { stdout, stderr = "" } = await execFile(powershell, [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; ` +
+          `if ($null -eq $p) { [Console]::Out.Write('null') } else { ` +
+          `$result = [pscustomobject][ordered]@{ ` +
+          `pid = [int]$p.Id; startedAt = $p.StartTime.ToUniversalTime().ToString('o') }; ` +
+          `[Console]::Out.Write((ConvertTo-Json -InputObject $result -Compress)) }`,
+      ], {
+        env: isolatedWindowsPowerShellEnvironment(),
+        timeout: 15_000,
+        maxBuffer: 256 * 1024,
+        windowsHide: true,
+      });
+      if (String(stderr).trim().length !== 0) {
+        throw new Error("Windows process identity query wrote unexpected stderr");
+      }
+      let value;
+      try {
+        value = JSON.parse(String(stdout));
+      } catch (cause) {
+        throw new Error("Windows process identity query stdout is not one JSON document", { cause });
+      }
+      if (value === null) return null;
+      if (
+        typeof value !== "object" ||
+        Array.isArray(value) ||
+        Object.keys(value).sort().join("\0") !== ["pid", "startedAt"].sort().join("\0") ||
+        value.pid !== pid ||
+        typeof value.startedAt !== "string" ||
+        !WINDOWS_PROCESS_STARTED_AT.test(value.startedAt)
+      ) {
+        throw new Error("Windows process identity query returned an invalid identity");
+      }
+      return { pid, startedAt: value.startedAt };
+    } catch (error) {
+      throw error;
+    }
+  }
+  let stdout;
+  try {
+    ({ stdout } = await execFile("/bin/ps", ["-p", String(pid), "-o", "pid=,lstart="]));
+  } catch (error) {
+    if (error?.code === 1) return null;
+    throw error;
+  }
+  const match = /^\s*(\d+)\s+(.+?)\s*$/.exec(stdout);
+  if (!match || Number(match[1]) !== pid || match[2].length === 0) return null;
+  return { pid, startedAt: match[2] };
+}
+
+async function currentLockIdentity(platform = process.platform) {
+  const identity = await readProcessIdentity(process.pid, platform);
+  if (identity === null) throw new Error("无法读取当前 CLI 进程身份");
+  return identity;
+}
+
+async function lockOptions(paths, platform = process.platform) {
+  return {
+    lockPath: paths.lockPath,
+    stateRoot: paths.stateRoot,
+    identity: await currentLockIdentity(platform),
+    readProcessIdentity: (pid) => readProcessIdentity(pid, platform),
+  };
+}
+
+export async function productionLockOptions(paths, platform = process.platform) {
+  return {
+    ...await lockOptions(paths, platform),
+    compactionThreshold: 8,
+  };
+}
+
+export async function acquireEphemeralControllerLease(paths, platform = process.platform) {
+  const stateRoot = join(paths.stateRoot, "ephemeral-controller");
+  const options = await lockOptions({
+    stateRoot,
+    lockPath: join(stateRoot, "operation.lock"),
+  }, platform);
+  try {
+    return await acquireOperationLock({
+      ...options,
+      operation: "controller:ephemeral-singleton",
+      platform,
+    });
+  } catch (error) {
+    if (error?.code === "LOCK_HELD") return null;
+    throw error;
+  }
+}
+
+const WINDOWS_PROCESS_STARTED_AT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{1,7}Z$/;
+const WINDOWS_CODEX_PROCESS_NAMES = new Set(["chatgpt", "codex"]);
+
+export async function probeWindowsCdpProcess(port, {
+  execFileImpl = execFile,
+  env = process.env,
+  powershellPath = windowsPowerShellPath(env),
+} = {}) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("Windows CDP port is invalid");
+  }
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    `$connections = @(Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction Stop)`,
+    "$records = @($connections | ForEach-Object {",
+    "  $owner = Get-Process -Id $_.OwningProcess -ErrorAction Stop",
+    "  [pscustomobject][ordered]@{",
+    "    pid = [int]$owner.Id",
+    "    executablePath = [string]$owner.Path",
+    "    startedAt = $owner.StartTime.ToUniversalTime().ToString('o')",
+    "    processName = [string]$owner.ProcessName",
+    "    localAddress = [string]$_.LocalAddress",
+    "    localPort = [int]$_.LocalPort",
+    "  }",
+    "})",
+    "[Console]::Out.Write((ConvertTo-Json -InputObject @($records) -Compress))",
+  ].join("\n");
+  const { stdout } = await execFileImpl(powershellPath, [
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    script,
+  ], {
+    env: isolatedWindowsPowerShellEnvironment(env),
+  });
+  let records;
+  try {
+    records = JSON.parse(String(stdout).trim());
+  } catch (cause) {
+    throw new Error("Windows CDP owner query returned invalid JSON", { cause });
+  }
+  if (!Array.isArray(records)) {
+    throw new Error("Windows CDP owner query did not return an array");
+  }
+  if (records.length === 0) return null;
+  if (records.length !== 1) {
+    throw new Error("Windows CDP loopback owner is not unique");
+  }
+  const record = records[0];
+  const exactKeys = [
+    "executablePath",
+    "localAddress",
+    "localPort",
+    "pid",
+    "processName",
+    "startedAt",
+  ];
+  if (
+    record === null ||
+    typeof record !== "object" ||
+    Array.isArray(record) ||
+    Object.keys(record).sort().join("\0") !== exactKeys.sort().join("\0")
+  ) {
+    throw new Error("Windows CDP owner record schema is invalid");
+  }
+  if (record.localAddress !== "127.0.0.1" || record.localPort !== port) {
+    throw new Error("Windows CDP owner is not an exact IPv4 loopback listener");
+  }
+  if (!Number.isSafeInteger(record.pid) || record.pid <= 0) {
+    throw new Error("Windows CDP owner PID is invalid");
+  }
+  if (
+    typeof record.processName !== "string" ||
+    !WINDOWS_CODEX_PROCESS_NAMES.has(record.processName.toLowerCase())
+  ) {
+    throw new Error("Windows CDP owner is not a Codex process");
+  }
+  if (
+    typeof record.executablePath !== "string" ||
+    !win32.isAbsolute(record.executablePath) ||
+    record.executablePath.includes("\0") ||
+    /[\r\n]/.test(record.executablePath)
+  ) {
+    throw new Error("Windows CDP owner executable path is invalid");
+  }
+  if (typeof record.startedAt !== "string" || !WINDOWS_PROCESS_STARTED_AT.test(record.startedAt)) {
+    throw new Error("Windows CDP owner process start time is invalid");
+  }
+  return {
+    pid: record.pid,
+    executablePath: record.executablePath,
+    startedAt: record.startedAt,
+  };
+}
+
+export async function validatePortOwner(port, processIdentity, {
+  platform = process.platform,
+  execFileImpl = execFile,
+  env = process.env,
+  powershellPath,
+} = {}) {
+  if (platform === "win32") {
+    try {
+      const observed = await probeWindowsCdpProcess(port, {
+        execFileImpl,
+        env,
+        ...(powershellPath === undefined ? {} : { powershellPath }),
+      });
+      return sameProcessIdentity(observed, processIdentity);
+    } catch {
+      return false;
+    }
+  }
+  let stdout;
+  try {
+    ({ stdout } = await execFileImpl("/usr/sbin/lsof", [
+      "-nP",
+      "-a",
+      "-p",
+      String(processIdentity.pid),
+      `-iTCP:${port}`,
+      "-sTCP:LISTEN",
+      "-t",
+    ]));
+  } catch {
+    return false;
+  }
+  const pids = stdout.split(/\s+/).filter(Boolean);
+  return pids.length === 1 && Number(pids[0]) === processIdentity.pid;
+}
+
+async function assertMacPortIsFree(port) {
+  try {
+    const { stdout } = await execFile("/usr/sbin/lsof", [
+      "-nP",
+      `-iTCP:${port}`,
+      "-sTCP:LISTEN",
+      "-t",
+    ]);
+    if (stdout.split(/\s+/).some(Boolean)) {
+      const error = new Error(`CDP 端口 ${port} 已被其他进程占用`);
+      error.code = "CDP_PORT_OCCUPIED";
+      throw error;
+    }
+  } catch (error) {
+    if (error?.code === 1) return true;
+    throw error;
+  }
+  return true;
+}
+
+export async function productionPreflight({
+  port,
+  requirePort = true,
+  platform = process.platform,
+  product = undefined,
+  dependencies = {},
+} = {}) {
+  const profile = productProfile(product);
+  if (platform === "win32") {
+    const queryWindowsRuntime = dependencies.queryWindowsRuntime ?? ((input) =>
+      queryWindowsRuntimeSnapshot({
+        ...input,
+        product: profile.id,
+        powershellPath: windowsPowerShellPath(),
+        commonScriptPath: join(repositoryRoot, "scripts", "windows", "lib", "common.ps1"),
+      }));
+    const snapshot = await queryWindowsRuntime({ port });
+    return classifyWindowsPreflightSnapshot(snapshot, { port, requirePort });
+  }
+  if (platform !== "darwin") throw new Error(`不支持的平台：${platform}`);
+  const resolveMacApp = dependencies.resolveMacApp ?? resolveCodexApp;
+  const listMacProcesses = dependencies.listMacProcesses ?? listCodexProcesses;
+  const validateMacPortOwner = dependencies.validateMacPortOwner ?? validatePortOwner;
+  const assertMacPortFree = dependencies.assertMacPortFree ?? assertMacPortIsFree;
+  const app = await resolveMacApp({ platform, product: profile.id });
+  const processes = await listMacProcesses({ app, product: profile.id });
+  // Codex 的调试端口写在命令行里，直接按参数筛；WorkBuddy 走环境变量看不到，
+  // 只能反过来问「谁在监听这个端口」，逐个候选做端口归属校验。
+  const ownsPort = async (entry) => validateMacPortOwner(port, publicProcess(entry), { platform });
+  let candidates;
+  if (!requirePort) {
+    candidates = processes;
+  } else if (profile.cdpPortVisibleInArgs) {
+    candidates = processes.filter((entry) => entry.cdpPort === port);
+  } else {
+    candidates = [];
+    for (const entry of processes) {
+      if (await ownsPort(entry)) candidates.push(entry);
+    }
+  }
+  if ((requirePort && candidates.length !== 1) || (!requirePort && candidates.length > 1)) {
+    const error = new Error(requirePort
+      ? `端口不属于目标 ${profile.label}：${port}`
+      : `无法唯一识别当前 ${profile.label} 进程`);
+    error.code = requirePort ? "CDP_NOT_OWNED" : "CODEX_PROCESS_AMBIGUOUS";
+    throw error;
+  }
+  const processIdentity = candidates.length === 0 ? null : publicProcess(candidates[0]);
+  if (requirePort && !(await validateMacPortOwner(port, processIdentity, { platform }))) {
+    const error = new Error(`端口不属于目标 ${profile.label}：${port}`);
+    error.code = "CDP_NOT_OWNED";
+    throw error;
+  }
+  if (!requirePort) await assertMacPortFree(port);
+  return {
+    appPath: app.appPath,
+    nodePath: process.execPath,
+    process: processIdentity,
+  };
+}
+
+export function createWindowsRuntimeProbe({ port, queryWindowsRuntime }) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("Windows controller port is invalid");
+  }
+  if (typeof queryWindowsRuntime !== "function") {
+    throw new Error("Windows controller runtime query is required");
+  }
+  // 同一次 probe 结果可在紧随其后的 validatePortOwner 中单次复用，
+  // 避免主题保存临界路径连续冷启动两次 PowerShell runtime snapshot。
+  let reusable = null;
+  const probe = async () => {
+    const snapshot = await queryWindowsRuntime({ port });
+    if (Array.isArray(snapshot?.listeners) && snapshot.listeners.length === 0) {
+      classifyWindowsPreflightSnapshot(snapshot, {
+        port,
+        requirePort: false,
+      });
+      reusable = { process: null, portProven: false };
+      return null;
+    }
+    const processIdentity = classifyWindowsPreflightSnapshot(snapshot, {
+      port,
+      requirePort: true,
+    }).process;
+    reusable = { process: processIdentity, portProven: true };
+    return processIdentity;
+  };
+  probe.consumePortProof = (candidate) => {
+    const current = reusable;
+    reusable = null;
+    if (current === null || current.portProven !== true) return false;
+    return sameProcessIdentity(current.process, candidate);
+  };
+  // Healthy ticks probe again after renderer inspection and leave an unused
+  // proof. Discard it so a later validatePortOwner cannot accept a stale claim.
+  probe.discardPortProof = () => {
+    reusable = null;
+  };
+  return probe;
+}
+
+export function probeWindowsNativeProcessFromSnapshot(snapshot, { port } = {}) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("Windows native probe port is invalid");
+  }
+  if (!Array.isArray(snapshot?.listeners)) {
+    throw new Error("Windows native probe snapshot is invalid");
+  }
+  // CDP 已在本机端口开放时，这不是“用户正常启动的原生 Codex”，不得触发 relaunch。
+  if (snapshot.listeners.length > 0) return null;
+  return classifyWindowsPreflightSnapshot(snapshot, {
+    port,
+    requirePort: false,
+  }).process;
+}
+
+export async function probeWindowsNativeProcess({ port, queryWindowsRuntime }) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("Windows native probe port is invalid");
+  }
+  if (typeof queryWindowsRuntime !== "function") {
+    throw new Error("Windows native probe runtime query is required");
+  }
+  const snapshot = await queryWindowsRuntime({ port });
+  return probeWindowsNativeProcessFromSnapshot(snapshot, { port });
+}
+
+export async function spawnWindowsRestartIntoCdp({
+  port,
+  nativeProcess,
+  powershellPath = windowsPowerShellPath(),
+  scriptPath = join(repositoryRoot, "scripts", "windows", "lib", "restart-into-cdp.ps1"),
+  env = process.env,
+  spawnImpl = spawn,
+  timeoutMs = 120_000,
+}) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("Windows restart-into-cdp port is invalid");
+  }
+  const processIdentity = publicProcess(nativeProcess);
+  if (typeof powershellPath !== "string" || powershellPath.length === 0) {
+    throw new Error("Windows restart-into-cdp PowerShell path is invalid");
+  }
+  if (typeof scriptPath !== "string" || !win32.isAbsolute(scriptPath)) {
+    throw new Error("Windows restart-into-cdp script path must be absolute");
+  }
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 300_000) {
+    throw new Error("Windows restart-into-cdp timeout is invalid");
+  }
+  const identityToken = env?.HEIGE_WINDOWS_APP_IDENTITY;
+  if (typeof identityToken !== "string" || identityToken.length === 0) {
+    throw new Error("Windows restart-into-cdp requires HEIGE_WINDOWS_APP_IDENTITY");
+  }
+  // 不可 detached：Store ActivateApplication 依赖当前交互会话；detached 子进程会静默失败且 stdio ignore 无日志。
+  // 控制器 await 本调用，同步跑完 Stop→Start-CodexWithCdp（通常十余秒）。
+  const child = spawnImpl(powershellPath, [
+    "-NoLogo",
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    scriptPath,
+    "-Port",
+    String(port),
+    "-ExpectedPid",
+    String(processIdentity.pid),
+    "-ExpectedExecutablePath",
+    processIdentity.executablePath,
+    "-ExpectedStartedAt",
+    processIdentity.startedAt,
+  ], {
+    detached: false,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+    env: {
+      ...isolatedWindowsPowerShellEnvironment(env),
+      HEIGE_WINDOWS_APP_IDENTITY: identityToken,
+    },
+  });
+  if (!child || (child.pid !== undefined && child.pid !== null && !Number.isSafeInteger(child.pid))) {
+    throw new Error("无法创建 Windows restart-into-cdp 进程");
+  }
+
+  const stdout = [];
+  const stderr = [];
+  if (child.stdout && typeof child.stdout.on === "function") {
+    child.stdout.on("data", (chunk) => stdout.push(Buffer.from(chunk)));
+  }
+  if (child.stderr && typeof child.stderr.on === "function") {
+    child.stderr.on("data", (chunk) => stderr.push(Buffer.from(chunk)));
+  }
+
+  const exitCode = await new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { child.kill(); } catch {}
+      reject(new Error(`Windows restart-into-cdp timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    const finish = (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(code);
+    };
+    child.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once("exit", (code, signal) => {
+      if (signal) {
+        finish(1);
+        return;
+      }
+      finish(code ?? 1);
+    });
+  });
+
+  if (exitCode !== 0) {
+    const detail = Buffer.concat(stderr).toString("utf8").trim()
+      || Buffer.concat(stdout).toString("utf8").trim()
+      || `exit ${exitCode}`;
+    throw new Error(`Windows restart-into-cdp failed: ${detail.slice(0, 500)}`);
+  }
+  return { pid: child.pid ?? null, exitCode: 0 };
+}
+
+/**
+ * 后台 Node 启动时再清一次同 task/state 的兄弟进程，避免 Stop-ScheduledTask 留下的孤儿
+ * 与当前实例叠成多后台抢锁（LOCK_DISAPPEARED / LOCK_HELD）。
+ */
+export async function ensureSoleWindowsBackgroundController({
+  taskName,
+  stateDirectory,
+  excludePid = process.pid,
+  powershellPath = windowsPowerShellPath(),
+  scheduledTaskScriptPath = join(
+    repositoryRoot,
+    "scripts",
+    "windows",
+    "lib",
+    "scheduled-task.ps1",
+  ),
+  env = process.env,
+  execFileImpl = execFile,
+} = {}) {
+  if (typeof taskName !== "string" || taskName.length === 0) {
+    throw new Error("Windows background singleton requires a task name");
+  }
+  if (typeof stateDirectory !== "string" || !win32.isAbsolute(stateDirectory)) {
+    throw new Error("Windows background singleton state directory must be absolute");
+  }
+  if (!Number.isSafeInteger(excludePid) || excludePid <= 0) {
+    throw new Error("Windows background singleton excludePid is invalid");
+  }
+  if (typeof powershellPath !== "string" || powershellPath.length === 0) {
+    throw new Error("Windows background singleton PowerShell path is invalid");
+  }
+  if (typeof scheduledTaskScriptPath !== "string" || !win32.isAbsolute(scheduledTaskScriptPath)) {
+    throw new Error("Windows background singleton script path must be absolute");
+  }
+  // 用 -Command 点源脚本后调用，便于传 ExcludePid（保留本进程）。
+  const command = [
+    `$ErrorActionPreference = 'Stop'`,
+    `. '${scheduledTaskScriptPath.replace(/'/g, "''")}'`,
+    `Stop-HeiGeBackgroundControllerProcesses -TaskName '${taskName.replace(/'/g, "''")}' `,
+    `-StateDirectory '${stateDirectory.replace(/'/g, "''")}' -ExcludePid ${excludePid} `,
+    `| ConvertTo-Json -Compress`,
+  ].join("; ");
+  const { stdout } = await execFileImpl(powershellPath, [
+    "-NoLogo",
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-Command",
+    command,
+  ], {
+    env: isolatedWindowsPowerShellEnvironment(env),
+    windowsHide: true,
+    timeout: 30_000,
+    maxBuffer: 1024 * 1024,
+  });
+  const text = String(stdout ?? "").trim();
+  if (!text) return { stoppedCount: 0, stoppedPids: [] };
+  try {
+    const parsed = JSON.parse(text);
+    return {
+      stoppedCount: Number(parsed.StoppedCount) || 0,
+      stoppedPids: Array.isArray(parsed.StoppedPids)
+        ? parsed.StoppedPids.map((value) => Number(value)).filter((value) => Number.isSafeInteger(value))
+        : [],
+    };
+  } catch {
+    return { stoppedCount: 0, stoppedPids: [], raw: text.slice(0, 200) };
+  }
+}
+
+export function createControllerPortOwnerValidator({
+  platform,
+  port,
+  probe,
+  windowsProbe = null,
+  validatePortOwnerImpl = validatePortOwner,
+}) {
+  if (platform !== "win32" && platform !== "darwin") {
+    throw new Error(`不支持的平台：${platform}`);
+  }
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("controller port is invalid");
+  }
+  if (typeof probe !== "function") {
+    throw new Error("controller process probe is required");
+  }
+  if (typeof validatePortOwnerImpl !== "function") {
+    throw new Error("controller port owner validator is required");
+  }
+
+  return async (candidate, { reuseCurrentProcessSnapshot = false } = {}) => {
+    if (platform === "win32") {
+      if (
+        typeof windowsProbe?.consumePortProof === "function" &&
+        windowsProbe.consumePortProof(candidate) === true
+      ) {
+        return true;
+      }
+      const current = await probe();
+      return sameProcessIdentity(current, candidate);
+    }
+
+    // A healthy tick supplies the process identity captured immediately before
+    // this check and performs another exact probe after renderer inspection.
+    // Reuse only in that bounded path; every mutation path still re-probes here.
+    if (reuseCurrentProcessSnapshot !== true) {
+      const current = await probe();
+      if (!sameProcessIdentity(current, candidate)) return false;
+    }
+    // The process snapshot proves identity, not socket ownership. Keep lsof.
+    return validatePortOwnerImpl(port, candidate, { platform });
+  };
+}
+
+function migrationFenceError(operation) {
+  const error = new Error(
+    `legacy migration is in progress; ${operation} must wait for recovery or completion`,
+  );
+  error.code = "LEGACY_MIGRATION_IN_PROGRESS";
+  return error;
+}
+
+function macosInstallFenceError(operation) {
+  const error = new Error(
+    `macOS install is in progress; ${operation} must wait for recovery or completion`,
+  );
+  error.code = "MACOS_INSTALL_IN_PROGRESS";
+  return error;
+}
+
+function isCanonicalAuthorizationPath(pathValue) {
+  if (typeof pathValue !== "string" || pathValue.includes("\0")) return false;
+  // 生产仅在 macOS；单测也可能在 Windows 上用本机绝对路径构造 journalPath。
+  if (posix.isAbsolute(pathValue) && posix.normalize(pathValue) === pathValue) return true;
+  return process.platform === "win32" &&
+    win32.isAbsolute(pathValue) &&
+    win32.normalize(pathValue) === pathValue;
+}
+
+export function parseMacosInstallAuthorization(value) {
+  if (value === undefined) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(value);
+  } catch (cause) {
+    throw new Error("macOS install authorization is not valid JSON", { cause });
+  }
+  const keys = [
+    "expectedControlToken",
+    "expectedRevision",
+    "journalPath",
+    "role",
+    "transactionId",
+  ];
+  if (
+    parsed === null ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    Object.keys(parsed).sort().join("\0") !== keys.sort().join("\0") ||
+    parsed.role !== "macos-install-ready-foreground" ||
+    typeof parsed.transactionId !== "string" ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(parsed.transactionId) ||
+    !isCanonicalAuthorizationPath(parsed.journalPath) ||
+    !Number.isSafeInteger(parsed.expectedRevision) ||
+    parsed.expectedRevision < 0 ||
+    typeof parsed.expectedControlToken !== "string" ||
+    !/^[A-Za-z0-9_-]{43}$/.test(parsed.expectedControlToken) ||
+    Buffer.from(parsed.expectedControlToken, "base64url").length !== 32 ||
+    Buffer.from(parsed.expectedControlToken, "base64url").toString("base64url") !==
+      parsed.expectedControlToken
+  ) {
+    throw new Error("macOS install authorization schema is invalid");
+  }
+  return Object.freeze({ ...parsed });
+}
+
+export async function enforceMacosInstallFence({
+  journalPath,
+  statePath,
+  transitionPath,
+  lease,
+  operation,
+  authorization = null,
+  startupHandshake = null,
+  backgroundIdentity = null,
+  requestContext = {},
+  dependencies = {},
+}) {
+  const readJournal = dependencies.readJournal ?? readMacosInstallJournal;
+  const readState = dependencies.readState ?? readStudioState;
+  const readTransition = dependencies.readTransition ?? readTransitionJournal;
+  const journal = await readJournal(journalPath, { lease });
+  const startupOuterTransaction = startupHandshake?.outerTransaction;
+  if (journal === null) {
+    if (authorization !== null || startupOuterTransaction != null) {
+      throw macosInstallFenceError(operation);
+    }
+    return { allowed: true, transactionId: null };
+  }
+  const expectedState = journal.stateParticipant?.afterState;
+  if (
+    journal.decision !== "undecided" ||
+    journal.phase !== "activation-planned" ||
+    journal.activation !== "controller" ||
+    expectedState?.persistenceEnabled !== true ||
+    !sameStudioState(await readState(statePath), expectedState) ||
+    await readTransition(transitionPath) !== null
+  ) {
+    throw macosInstallFenceError(operation);
+  }
+  const authorizationMatches =
+    authorization !== null &&
+    typeof authorization === "object" &&
+    !Array.isArray(authorization) &&
+    authorization.role === "macos-install-ready-foreground" &&
+    authorization.transactionId === journal.transactionId &&
+    authorization.journalPath === journalPath &&
+    authorization.expectedRevision === expectedState.revision &&
+    authorization.expectedControlToken === expectedState.controlToken;
+  const foregroundOperationAllowed =
+    operation === "controller:start" ||
+    (
+      ["controller:set-persistence", "controller:finalize-enable"].includes(operation) &&
+      requestContext?.desiredPersistenceEnabled === true &&
+      requestContext?.expectedRevision === expectedState.revision
+    );
+  if (authorizationMatches && foregroundOperationAllowed) {
+    return { allowed: true, transactionId: journal.transactionId, role: authorization.role };
+  }
+  const requestCreatedAt = Date.parse(startupHandshake?.createdAt);
+  const backgroundOuterMatches =
+    startupOuterTransaction !== null &&
+    typeof startupOuterTransaction === "object" &&
+    !Array.isArray(startupOuterTransaction) &&
+    Object.keys(startupOuterTransaction).sort().join("\0") ===
+      ["journalPath", "transactionId"].join("\0") &&
+    startupOuterTransaction.transactionId === journal.transactionId &&
+    startupOuterTransaction.journalPath === journalPath;
+  const backgroundAllowed =
+    operation === "controller:start" &&
+    startupHandshake !== null &&
+    typeof startupHandshake === "object" &&
+    startupHandshake.revision === expectedState.revision &&
+    startupHandshake.platform === "darwin" &&
+    startupHandshake.backgroundIdentity === CONTROLLER_LAUNCH_AGENT_LABEL &&
+    backgroundIdentity === CONTROLLER_LAUNCH_AGENT_LABEL &&
+    backgroundOuterMatches &&
+    Number.isFinite(requestCreatedAt) &&
+    requestCreatedAt >= Date.parse(journal.createdAt);
+  if (backgroundAllowed) {
+    return {
+      allowed: true,
+      transactionId: journal.transactionId,
+      role: "macos-install-ready-background",
+    };
+  }
+  throw macosInstallFenceError(operation);
+}
+
+export async function enforceLegacyMigrationFence({
+  journalPath,
+  statePath,
+  transitionPath,
+  lease,
+  operation,
+  authorization = null,
+  startupHandshake = null,
+  dependencies = {},
+}) {
+  const readCoordinator = dependencies.readCoordinator ?? readLegacyMigrationCoordinator;
+  const readState = dependencies.readState ?? readStudioState;
+  const readTransition = dependencies.readTransition ?? readTransitionJournal;
+  const coordinator = await readCoordinator(journalPath, { lease });
+  if (coordinator === null) {
+    if (authorization !== null) throw migrationFenceError(operation);
+    return { allowed: true, transactionId: null };
+  }
+  if (
+    coordinator.decision !== "undecided" ||
+    coordinator.phase !== "service-prepared" ||
+    coordinator.serviceParticipant === null ||
+    coordinator.stateParticipant.afterState === null
+  ) {
+    throw migrationFenceError(operation);
+  }
+  const expectedState = coordinator.stateParticipant.afterState;
+  const currentState = await readState(statePath);
+  if (!sameStudioState(currentState, expectedState)) {
+    throw migrationFenceError(operation);
+  }
+  if (await readTransition(transitionPath) !== null) {
+    throw migrationFenceError(operation);
+  }
+
+  const foregroundAllowed =
+    authorization !== null &&
+    typeof authorization === "object" &&
+    !Array.isArray(authorization) &&
+    authorization.role === "migration-ready-foreground" &&
+    authorization.transactionId === coordinator.transactionId &&
+    authorization.journalPath === journalPath &&
+    authorization.expectedRevision === expectedState.revision &&
+    authorization.expectedControlToken === expectedState.controlToken &&
+    ["controller:set-persistence", "controller:finalize-enable"].includes(operation);
+  if (foregroundAllowed) {
+    return { allowed: true, transactionId: coordinator.transactionId, role: authorization.role };
+  }
+
+  const requestCreatedAt = Date.parse(startupHandshake?.createdAt);
+  const backgroundAllowed =
+    operation === "controller:start" &&
+    startupHandshake !== null &&
+    typeof startupHandshake === "object" &&
+    startupHandshake.revision === expectedState.revision &&
+    Number.isFinite(requestCreatedAt) &&
+    requestCreatedAt >= Date.parse(coordinator.createdAt);
+  if (backgroundAllowed) {
+    return {
+      allowed: true,
+      transactionId: coordinator.transactionId,
+      role: "migration-ready-background",
+    };
+  }
+  throw migrationFenceError(operation);
+}
+
+const PRODUCTION_LEASE_RETRY_DELAYS_MS = Object.freeze([
+  100, 200, 400, 800, 1600, 3200,
+]);
+const LOCK_HELD_ACTION_STARTED = Symbol("heige.lockHeldActionStarted");
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function isTransientLockAcquisitionError(error) {
+  try {
+    const code = error?.code;
+    // LOCK_HELD：他人持有；LOCK_MALFORMED：staging 尚未写完 owner.json；
+    // LOCK_PERMISSIONS：他人仍打开目录时 protect/heal 会失败，属瞬时争用而非永久 ACL 损坏；
+    // LOCK_DISAPPEARED：并发 cleanup/rename 让 staging 在两步之间消失，属瞬时竞态。
+    return (
+      code === "LOCK_HELD" ||
+      code === "LOCK_MALFORMED" ||
+      code === "LOCK_PERMISSIONS" ||
+      code === "LOCK_DISAPPEARED"
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Retry only while lock acquisition itself fails with LOCK_HELD / LOCK_MALFORMED / LOCK_PERMISSIONS.
+ * Once the protected action has started, failures fail closed without retry.
+ */
+export async function withLockHeldRetry(
+  run,
+  {
+    delaysMs = PRODUCTION_LEASE_RETRY_DELAYS_MS,
+    wait = sleep,
+  } = {},
+) {
+  if (typeof run !== "function") throw new TypeError("run must be a function");
+  if (!Array.isArray(delaysMs) || delaysMs.some((value) => !Number.isSafeInteger(value) || value < 0)) {
+    throw new TypeError("delaysMs must be an array of non-negative safe integers");
+  }
+  if (typeof wait !== "function") throw new TypeError("wait must be a function");
+
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await run();
+    } catch (error) {
+      if (
+        error?.[LOCK_HELD_ACTION_STARTED] === true ||
+        !isTransientLockAcquisitionError(error) ||
+        attempt >= delaysMs.length
+      ) {
+        throw error;
+      }
+      await wait(delaysMs[attempt]);
+    }
+  }
+}
+
+async function withProductionStateLease({
+  paths,
+  options,
+  operation,
+  authorization = null,
+  installAuthorization = null,
+  startupHandshake = null,
+  backgroundIdentity = null,
+  requestContext = {},
+}, action) {
+  return withLockHeldRetry(async () => {
+    let actionStarted = false;
+    try {
+      return await withOperationLock({ ...options, operation }, async (lease) => {
+        await enforceLegacyMigrationFence({
+          journalPath: legacyMigrationJournalPath(paths.stateRoot),
+          statePath: paths.statePath,
+          transitionPath: paths.transitionPath,
+          lease,
+          operation,
+          authorization,
+          startupHandshake,
+        });
+        await enforceMacosInstallFence({
+          journalPath: macosInstallJournalPath(paths.stateRoot),
+          statePath: paths.statePath,
+          transitionPath: paths.transitionPath,
+          lease,
+          operation,
+          authorization: installAuthorization,
+          startupHandshake,
+          backgroundIdentity,
+          requestContext,
+        });
+        actionStarted = true;
+        return action(lease);
+      });
+    } catch (error) {
+      if (actionStarted && error && typeof error === "object") {
+        error[LOCK_HELD_ACTION_STARTED] = true;
+      }
+      throw error;
+    }
+  });
+}
+
+async function ensureProductionState({ paths, themeId, process: processIdentity, keepUntilProcessExit }) {
+  const options = await productionLockOptions(paths);
+  return withProductionStateLease({
+    paths,
+    options,
+    operation: "cli:prepare-state",
+  }, async (lease) => {
+    let state = await readStudioState(paths.statePath);
+    if (state === null) {
+      state = createDefaultStudioState({
+        themeId,
+        token: randomBytes(32).toString("base64url"),
+      });
+      state = await writeStudioState(paths.statePath, state, { lease });
+    } else if (state.selectedThemeId !== themeId || state.lastNonNativeThemeId !== themeId) {
+      state = await compareAndUpdateStudioState(paths.statePath, {
+        lease,
+        expectedRevision: state.revision,
+        mutate: (current) => ({
+          ...current,
+          selectedThemeId: themeId,
+          lastNonNativeThemeId: themeId,
+        }),
+      });
+    }
+    if (processIdentity !== undefined) {
+      await writeSessionState(paths.sessionPath, {
+        schemaVersion: 1,
+        mode: "active",
+        process: processIdentity,
+        activeThemeId: themeId,
+        keepUntilProcessExit,
+      }, { lease });
+    }
+    return state;
+  });
+}
+
+async function themeBundle({ deps, roots, themeId, userThemesRoot = null }) {
+  const themes = await deps.listThemes({ roots });
+  const selected = themes.find((theme) => theme.id === themeId);
+  if (!selected) throw new Error(`找不到主题：${themeId}`);
+  const originFor = (themePath) => {
+    if (typeof userThemesRoot !== "string" || userThemesRoot.length === 0) return "bundled";
+    try {
+      const rel = relative(userThemesRoot, themePath);
+      if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) return "user";
+    } catch {
+      return "bundled";
+    }
+    return "bundled";
+  };
+  const loadedTheme = await deps.loadTheme(selected.path);
+  loadedTheme.origin = originFor(selected.path);
+  const menuThemes = [];
+  for (const theme of themes) {
+    if (theme.id === themeId) {
+      menuThemes.push(loadedTheme);
+      continue;
+    }
+    try {
+      const loaded = await deps.loadTheme(theme.path);
+      loaded.origin = originFor(theme.path);
+      menuThemes.push(loaded);
+    } catch {
+      // 坏主题不进入菜单，也不阻断一个已经完整验证的目标主题。
+    }
+  }
+  return { loadedTheme, menuThemes, selected, themes };
+}
+
+export function controllerInjectionPreference({ ephemeral = false, preferStored } = {}) {
+  if (preferStored !== undefined && typeof preferStored !== "boolean") {
+    throw new TypeError("preferStored 必须是布尔值");
+  }
+  return preferStored ?? !ephemeral;
+}
+
+function windowsPowerShellPath(env = process.env) {
+  return trustedWindowsPowerShellPath(env);
+}
+
+async function runWindowsControllerAction({
+  action,
+  taskName,
+  port,
+  stateRoot,
+  revision,
+  transitionNonce,
+  env = process.env,
+}) {
+  const identityToken = typeof env?.HEIGE_WINDOWS_APP_IDENTITY === "string"
+    ? env.HEIGE_WINDOWS_APP_IDENTITY
+    : "";
+  const args = [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    join(repositoryRoot, "scripts", "windows", "controller.ps1"),
+    "-Action",
+    action,
+    "-TaskName",
+    taskName,
+    "-Port",
+    String(port),
+    "-StateDirectory",
+    stateRoot,
+  ];
+  if (identityToken) {
+    args.push("-AppIdentityToken", identityToken);
+  }
+  if (action === "start") {
+    args.push(
+      "-ExpectedRevision",
+      String(revision),
+      "-ExpectedTransitionNonce",
+      transitionNonce,
+    );
+  }
+  const childEnv = {
+    ...isolatedWindowsPowerShellEnvironment(env),
+    ...(identityToken ? { HEIGE_WINDOWS_APP_IDENTITY: identityToken } : {}),
+  };
+  const { stdout } = await execFile(windowsPowerShellPath(env), args, {
+    env: childEnv,
+    windowsHide: true,
+  });
+  const text = stdout.trim();
+  if (text.length === 0) return {};
+  try {
+    return JSON.parse(text);
+  } catch (cause) {
+    throw new Error(`Windows controller ${action} 返回了无效 JSON`, { cause });
+  }
+}
+
+export function normalizeWindowsBackgroundStatus(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return { registered: false, running: false };
+  }
+  const registered = value.Exists === true;
+  return {
+    registered,
+    running: registered && value.TaskRunning === true && value.State === "Running",
+  };
+}
+
+export function createBackgroundReadinessVerifier({
+  stateRoot,
+  platform,
+  backgroundIdentity,
+  forbiddenPid = process.pid,
+  readIdentity = (pid) => readProcessIdentity(pid, platform),
+  wait = waitForBackgroundHandshake,
+  consume = consumeBackgroundHandshake,
+}) {
+  let verified = null;
+  const processIdentity = (value) => (
+    Number.isSafeInteger(value?.pid) &&
+    value.pid > 0 &&
+    typeof value?.startedAt === "string" &&
+    value.startedAt.length > 0
+  ) ? { pid: value.pid, startedAt: value.startedAt } : null;
+  const expected = ({ revision, transitionNonce }) => ({
+    revision,
+    transitionNonce,
+    platform,
+    backgroundIdentity,
+    outcome: "ready",
+  });
+  return Object.freeze({
+    async verify({ revision, transitionNonce, handshakeRequest }) {
+      verified = null;
+      const notBefore = handshakeRequest?.notBefore;
+      // Windows 注册/拉起计划任务 + Node 冷启动 + 锁争用重试常超过 10s。
+      const timeoutMs = platform === "win32" ? 35_000 : 10_000;
+      const observed = await wait({
+        stateRoot,
+        expected: expected({ revision, transitionNonce }),
+        forbiddenPid,
+        notBefore,
+        timeoutMs,
+        readProcessIdentity: readIdentity,
+      });
+      const identity = observed.outcome === "ready" ? processIdentity(observed) : null;
+      if (identity === null) return null;
+      verified = { revision, transitionNonce, notBefore, identity };
+      return { ...identity };
+    },
+    async consume({ revision, transitionNonce } = {}) {
+      if (
+        verified === null ||
+        verified.revision !== revision ||
+        verified.transitionNonce !== transitionNonce
+      ) {
+        return null;
+      }
+      const claim = verified;
+      verified = null;
+      try {
+        const observed = await consume({
+          stateRoot,
+          expected: expected(claim),
+          forbiddenPid,
+          notBefore: claim.notBefore,
+          readProcessIdentity: readIdentity,
+        });
+        const identity = observed.outcome === "ready" ? processIdentity(observed) : null;
+        return identity !== null &&
+          identity.pid === claim.identity.pid &&
+          identity.startedAt === claim.identity.startedAt
+          ? { ...identity }
+          : null;
+      } catch {
+        return null;
+      }
+    },
+    discard() {
+      verified = null;
+    },
+  });
+}
+
+export async function productionController({
+  port,
+  paths,
+  roots,
+  deps,
+  ephemeral = false,
+  preferStored,
+  platform = process.platform,
+  taskName,
+  startupHandshake = null,
+  background = false,
+  migrationAuthorization = null,
+  installAuthorization = null,
+  preflight = null,
+}) {
+  const profile = productProfile(deps.product);
+  const injectionPreferStored = controllerInjectionPreference({ ephemeral, preferStored });
+  const backgroundIdentity = controllerBackgroundIdentity(
+    platform,
+    platform === "win32" ? (taskName ?? windowsProductionTask(profile.id)) : taskName,
+    profile.id,
+  );
+  const lock = await productionLockOptions(paths, platform);
+  let deferredWindowsUnregister = false;
+  const queryWindowsRuntime = deps.queryWindowsRuntime ?? ((input) =>
+    queryWindowsRuntimeSnapshot({
+      ...input,
+      product: profile.id,
+      powershellPath: windowsPowerShellPath(),
+      commonScriptPath: join(repositoryRoot, "scripts", "windows", "lib", "common.ps1"),
+    }));
+  const probeWindows = platform === "win32"
+    ? createWindowsRuntimeProbe({ port, queryWindowsRuntime })
+    : null;
+  // 端口在命令行里可见就按参数筛；WorkBuddy 走环境变量看不到，只能问 lsof「谁在监听」
+  const ownsCdpPort = async (entry) => (
+    profile.cdpPortVisibleInArgs
+      ? entry.cdpPort === port
+      : entry.cdpPort === null && await validatePortOwner(port, publicProcess(entry), { platform })
+  );
+  let lastKnownCdpPid = null;
+  const probe = async () => {
+    if (platform === "win32") return probeWindows();
+    const app = await resolveCodexApp({ platform, product: profile.id });
+    // 快速路径：上次确认的 pid 仍指向同一 CDP 进程时，用单行 ps 代替全表扫描。
+    // lstart+命令行双重校验由 parseCodexProcessTable 完成，身份漂移则落回全表。
+    if (lastKnownCdpPid !== null) {
+      try {
+        const { stdout } = await execFile("/bin/ps", ["-p", String(lastKnownCdpPid), "-o", "pid=,lstart=,command="]);
+        const rows = parseCodexProcessTable(stdout, app, { product: profile.id })
+          .filter((entry) => entry.pid === lastKnownCdpPid);
+        const hit = [];
+        for (const entry of rows) {
+          if (await ownsCdpPort(entry)) hit.push(entry);
+        }
+        if (hit.length === 1) return publicProcess(hit[0]);
+      } catch {}
+      lastKnownCdpPid = null;
+    }
+    const processes = await listCodexProcesses({ app, product: profile.id });
+    const candidates = [];
+    for (const entry of processes) {
+      if (await ownsCdpPort(entry)) candidates.push(entry);
+    }
+    if (candidates.length === 0) return null;
+    if (candidates.length !== 1) throw new Error(`${profile.label} 进程身份不唯一`);
+    lastKnownCdpPid = candidates[0].pid;
+    return publicProcess(candidates[0]);
+  };
+  const controllerPortOwnerValidator = createControllerPortOwnerValidator({
+    platform,
+    port,
+    probe,
+    windowsProbe: probeWindows,
+  });
+  // 用户正常启动的 Codex 不带任何 CDP 端口，这正是常驻要接管的那一个。
+  const probeNative = async () => {
+    const app = await resolveCodexApp({ platform, product: profile.id });
+    const processes = await listCodexProcesses({ app, product: profile.id });
+    const candidates = [];
+    for (const entry of processes) {
+      // 「原生」= 完全没开调试端口的实例。命令行看得见端口就直接判 null；
+      // 看不见的（WorkBuddy）只能用「不监听我们这个端口」近似，别退化成「端口不等于 port」
+      const native = profile.cdpPortVisibleInArgs
+        ? entry.cdpPort === null
+        : !(await validatePortOwner(port, publicProcess(entry), { platform }));
+      if (native) candidates.push(entry);
+    }
+    if (candidates.length === 0) return null;
+    if (candidates.length !== 1) throw new Error(`${profile.label} 原生进程身份不唯一`);
+    return publicProcess(candidates[0]);
+  };
+  if (preflight?.process !== undefined && preflight.process !== null) {
+    const current = await probe();
+    if (!sameProcessIdentity(current, preflight.process)) {
+      throw new Error("Codex 进程在 controller 创建前已变化");
+    }
+  }
+  const initial = await readStudioState(paths.statePath);
+  const currentVersion = await deps.readCurrentPackageVersion();
+  const checkForUpdate = deps.createCachedUpdateChecker({ currentVersion });
+  const logger = createStudioLogger({
+    path: paths.logPath,
+    token: initial?.controlToken ?? "",
+  });
+  const readiness = createBackgroundReadinessVerifier({
+    stateRoot: paths.stateRoot,
+    platform,
+    backgroundIdentity,
+  });
+  return createSkinController({
+    backgroundProcess: background,
+    supportsControlChannel: profile.supportsControlChannel,
+    supportsRendererControlFallback:
+      platform === "win32" && profile.supportsWindowsRendererControlFallback === true,
+    allowInternalPersistenceEnable:
+      migrationAuthorization !== null || installAuthorization !== null,
+    currentVersion,
+    checkForUpdate,
+    deliverUpdateCheckResult: (payload) => deps.deliverUpdateCheckResult({
+      port,
+      ...payload,
+    }),
+    deliverThemeSelectionResult: (payload) => deps.deliverThemeSelectionResult({
+      port,
+      ...payload,
+    }),
+    statePath: paths.statePath,
+    sessionPath: paths.sessionPath,
+    transitionPath: paths.transitionPath,
+    withLease: (operation, action, context = {}) => withProductionStateLease({
+      paths,
+      options: lock,
+      operation,
+      authorization: migrationAuthorization,
+      installAuthorization,
+      startupHandshake: context.startupHandshake ?? null,
+      backgroundIdentity,
+      requestContext: context,
+    }, action),
+    probeCurrentProcess: probe,
+    // 常驻开启后，用户正常启动的 Codex 不带 CDP；后台控制器必须把它拉回调试模式再注入。
+    // macOS 走 lifecycle-helper；Windows 走 PowerShell Stop/Start-CodexWithCdp（附着等待，非 detached）。
+    ...(platform === "darwin"
+      ? {
+        probeNativeProcess: probeNative,
+        restartIntoCdp: async ({ process: nativeProcess }) => {
+          const app = await resolveCodexApp({ platform });
+          // 不带 afterLaunch：本控制器就在运行，Codex 一带着 CDP 回来它自己会注入。
+          return productionRestartDetached({
+            paths,
+            preflight: {
+              appPath: app.appPath,
+              nodePath: process.execPath,
+              process: nativeProcess,
+            },
+            launchMode: "cdp",
+            port,
+            platform,
+          });
+        },
+      }
+      : platform === "win32"
+      ? {
+        probeNativeProcess: () => probeWindowsNativeProcess({
+          port,
+          queryWindowsRuntime,
+        }),
+        restartIntoCdp: async ({ process: nativeProcess }) => spawnWindowsRestartIntoCdp({
+          port,
+          nativeProcess,
+          powershellPath: windowsPowerShellPath(),
+        }),
+      }
+      : {}),
+    validatePortOwner: controllerPortOwnerValidator,
+    ...(typeof probeWindows?.discardPortProof === "function"
+      ? { discardPortProof: () => probeWindows.discardPortProof() }
+      : {}),
+    inspectSkin: (options = {}) => deps.skinStatus({
+      port,
+      includeControlRequest: options?.purpose === "renderer-control-request",
+    }),
+    validateThemeSelection: async (themeId) => {
+      try {
+        const resolve = deps.resolveAndLoadTheme ?? resolveAndLoadTheme;
+        await resolve({ roots, id: themeId });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    createUserThemeFromBytes: async ({ bytes, extension, name, colors }) => {
+      const create = deps.createSingleImageThemeFromBytes ?? createSingleImageThemeFromBytes;
+      return create({
+        bytes,
+        extension,
+        name,
+        storeRoot: paths.userThemesRoot,
+        ...(colors === undefined ? {} : { colors }),
+      });
+    },
+    removeUserTheme: async ({ id }) => {
+      const remove = deps.removeUserThemeFromStore ?? removeUserThemeFromStore;
+      return remove({ storeRoot: paths.userThemesRoot, id });
+    },
+    injectSkin: async ({ themeId, control, targetIds, preferStored: requestPreference }) => {
+      const state = await readStudioState(paths.statePath);
+      const effectiveThemeId = themeId === NATIVE_THEME_ID
+        ? state?.lastNonNativeThemeId ?? DEFAULT_THEME_ID
+        : themeId;
+      const bundle = await themeBundle({
+        deps,
+        roots,
+        themeId: effectiveThemeId,
+        userThemesRoot: paths.userThemesRoot,
+      });
+      return deps.applySkin({
+        loadedTheme: bundle.loadedTheme,
+        themes: bundle.menuThemes,
+        activeId: themeId === NATIVE_THEME_ID ? null : effectiveThemeId,
+        port,
+        currentVersion,
+        preferStored: requestPreference ?? injectionPreferStored,
+        control,
+        targetIds,
+      });
+    },
+    removeSkin: () => deps.removeSkin({ port }),
+    prepareBackgroundHandshake: async ({ revision, transitionNonce }) => {
+      readiness.discard();
+      await removeBackgroundHandshake({ stateRoot: paths.stateRoot });
+      await removeLegacyBackgroundStartRequest({ stateRoot: paths.stateRoot });
+      const request = await publishBackgroundStartRequest({
+        stateRoot: paths.stateRoot,
+        revision,
+        transitionNonce,
+        platform,
+        backgroundIdentity,
+        outerTransaction: installAuthorization === null
+          ? null
+          : {
+            transactionId: installAuthorization.transactionId,
+            journalPath: installAuthorization.journalPath,
+          },
+      });
+      return { notBefore: Date.parse(request.createdAt) };
+    },
+    registerBackground: () => platform === "darwin"
+      ? registerControllerAgent().then((value) => ({
+        ...value,
+        registered: value.loaded === true,
+      }))
+      : runWindowsControllerAction({
+        action: "register",
+        taskName: backgroundIdentity,
+        port,
+        stateRoot: paths.stateRoot,
+      }).then((value) => ({
+        ...value,
+        registered: value.Registered === true || value.Exists === true,
+      })),
+    unregisterBackground: async () => {
+      readiness.discard();
+      if (platform === "darwin") {
+        const value = await unregisterControllerAgent({
+          deferIfCurrentProcess: background,
+        });
+        await removeBackgroundStartRequest({ stateRoot: paths.stateRoot }).catch((error) => {
+          if (error?.code !== "ENOENT") throw error;
+        });
+        await removeBackgroundHandshake({ stateRoot: paths.stateRoot }).catch((error) => {
+          if (error?.code !== "ENOENT") throw error;
+        });
+        return { ...value, registered: false };
+      }
+      if (startupHandshake !== null) {
+        deferredWindowsUnregister = true;
+        return { registered: false, loaded: false, deferred: true };
+      }
+      const value = await runWindowsControllerAction({
+        action: "unregister",
+        taskName: backgroundIdentity,
+        port,
+        stateRoot: paths.stateRoot,
+      });
+      await removeBackgroundStartRequest({ stateRoot: paths.stateRoot }).catch((error) => {
+        if (error?.code !== "ENOENT") throw error;
+      });
+      await removeBackgroundHandshake({ stateRoot: paths.stateRoot }).catch((error) => {
+        if (error?.code !== "ENOENT") throw error;
+      });
+      return { ...value, registered: false, loaded: false };
+    },
+    inspectBackground: async (expected) => {
+      let status;
+      if (platform === "darwin") {
+        const value = await inspectLaunchAgent();
+        status = {
+          ...value,
+          registered: value.plistExists === true && value.loaded === true,
+          running: value.loaded === true,
+        };
+      } else {
+        if (deferredWindowsUnregister) {
+          return { registered: false, running: false, loaded: false, deferred: true };
+        }
+        const value = await runWindowsControllerAction({
+          action: "status",
+          taskName: backgroundIdentity,
+          port,
+          stateRoot: paths.stateRoot,
+        });
+        status = { ...value, ...normalizeWindowsBackgroundStatus(value) };
+      }
+      const processIdentity = status.registered === true && status.running === true
+        ? await readiness.consume(expected)
+        : null;
+      return {
+        ...status,
+        loaded: processIdentity !== null,
+        processIdentity,
+      };
+    },
+    wakeBackground: (request) => platform === "darwin"
+      ? wakeControllerAgent()
+      : runWindowsControllerAction({
+        action: "start",
+        taskName: backgroundIdentity,
+        port,
+        stateRoot: paths.stateRoot,
+        revision: request.revision,
+        transitionNonce: request.transitionNonce,
+      }),
+    verifyBackgroundHandshake: (input) => readiness.verify(input),
+    preflightEnable: async () => true,
+    logger,
+  });
+}
+
+/** 空闲健康巡检 10s；relaunch/注入/修复等交互跟随时 1s，避免 CDP 兜底最坏等一整拍。 */
+export function controllerTickWaitMs(previousResult) {
+  if (previousResult?.interactive === true) return 1_000;
+  const action = previousResult?.action;
+  if (
+    action === "relaunch" ||
+    action === "wait-for-app" ||
+    action === "inject" ||
+    action === "repair" ||
+    action === "paused"
+  ) {
+    return 1_000;
+  }
+  return 10_000;
+}
+
+export async function runControllerProcess(controller, {
+  once = false,
+  ephemeralRuntime = false,
+  startupHandshake = null,
+  backgroundRuntime = null,
+  paths,
+  claimStartRequest = claimBackgroundStartRequest,
+  publishHandshake = publishBackgroundHandshake,
+  readCurrentIdentity,
+  wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  ensureSoleWindowsBackground = ensureSoleWindowsBackgroundController,
+} = {}) {
+  if (startupHandshake !== null && backgroundRuntime !== null) {
+    throw new Error("background controller cannot combine inline and one-shot handshake requests");
+  }
+  let activeHandshake = startupHandshake;
+  if (backgroundRuntime !== null) {
+    if (
+      backgroundRuntime === null ||
+      typeof backgroundRuntime !== "object" ||
+      !["darwin", "win32"].includes(backgroundRuntime.platform) ||
+      typeof backgroundRuntime.backgroundIdentity !== "string" ||
+      backgroundRuntime.backgroundIdentity.length === 0
+    ) {
+      throw new Error("background runtime identity is invalid");
+    }
+    if (backgroundRuntime.platform === "win32") {
+      try {
+        await ensureSoleWindowsBackground({
+          taskName: backgroundRuntime.backgroundIdentity,
+          stateDirectory: paths.stateRoot,
+          excludePid: process.pid,
+        });
+      } catch {
+        // 清兄弟失败不应阻断握手；后续锁重试仍可吸收瞬时争用。
+      }
+    }
+    activeHandshake = await claimStartRequest({
+      stateRoot: paths.stateRoot,
+      platform: backgroundRuntime.platform,
+      backgroundIdentity: backgroundRuntime.backgroundIdentity,
+    });
+  }
+  let result = await controller.start({ startupHandshake: activeHandshake });
+  if (activeHandshake !== null) {
+    try {
+      if (result?.action === "error" || result?.mode === "error") {
+        throw new Error("controller start failed before background handshake");
+      }
+      if (result?.revision !== activeHandshake.revision) {
+        throw new Error("controller start revision does not match the handshake request");
+      }
+      const outcome = result.action === "unregister" ? "unregister" : "ready";
+      if (
+        (outcome === "ready" && result.persistenceEnabled !== true) ||
+        (outcome === "unregister" && result.persistenceEnabled !== false)
+      ) {
+        throw new Error("controller start outcome does not match authoritative persistence state");
+      }
+      const identity = await (readCurrentIdentity ?? (() =>
+        readProcessIdentity(process.pid, activeHandshake.platform)))();
+      if (
+        identity === null ||
+        identity?.pid !== process.pid ||
+        typeof identity?.startedAt !== "string" ||
+        identity.startedAt.length === 0
+      ) {
+        throw new Error("controller process identity is unavailable for background handshake");
+      }
+      await publishHandshake({
+        stateRoot: paths.stateRoot,
+        revision: activeHandshake.revision,
+        transitionNonce: activeHandshake.transitionNonce,
+        platform: activeHandshake.platform,
+        backgroundIdentity: activeHandshake.backgroundIdentity,
+        pid: identity.pid,
+        startedAt: identity.startedAt,
+        outcome,
+      });
+    } catch (error) {
+      await controller.stop();
+      throw error;
+    }
+  }
+  const handoffEphemeral = async (current) => {
+    const handedOff = await controller.setPersistence({
+      expectedRevision: current.revision,
+      enabled: true,
+    });
+    if (handedOff?.persistenceEnabled !== true) {
+      throw new Error("ephemeral handoff did not confirm background persistence");
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    await controller.stop();
+    return {
+      action: "handoff",
+      mode: current.mode,
+      persistenceEnabled: handedOff.persistenceEnabled,
+      revision: handedOff.revision,
+    };
+  };
+  const pendingEnableJournal = async () => {
+    if (typeof controller.pendingTransition !== "function") return false;
+    try {
+      return await controller.pendingTransition() !== null;
+    } catch {
+      return false;
+    }
+  };
+  const tryHandoffEphemeral = async (current) => {
+    if (!ephemeralRuntime || current?.persistenceEnabled !== true) return null;
+    if (current.action === "error" || current.action === "unregister") return null;
+    if (await pendingEnableJournal()) return null;
+    try {
+      return await handoffEphemeral(current);
+    } catch {
+      // 常驻后台没起来时，会话控制器必须留下，否则主题中心 HTTP/CDP 都会空转超时。
+      return null;
+    }
+  };
+  const handedOffAtStart = await tryHandoffEphemeral(result);
+  if (handedOffAtStart !== null) return handedOffAtStart;
+  if (once || result.action === "unregister" || result.action === "error") {
+    await controller.stop();
+    return result;
+  }
+  while (true) {
+    // 空闲健康巡检保持 10s；交互态（relaunch/注入/CDP 兜底）用 1s，与健康税解耦。
+    await wait(controllerTickWaitMs(result));
+    result = await controller.tick();
+    if (result.action === "unregister" || result.action === "handoff") {
+      await controller.stop();
+      return result;
+    }
+    const handedOff = await tryHandoffEphemeral(result);
+    if (handedOff !== null) return handedOff;
+  }
+}
+
+export async function waitForAppliedSkin({
+  deps,
+  port,
+  themeId,
+  // Store/cold-start Codex can take >20s before the main renderer answers CDP.
+  attempts = 160,
+  wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  progress = (message) => {
+    try {
+      process.stderr.write(`${message}\n`);
+    } catch {}
+  },
+}) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const status = await deps.skinStatus({ port });
+      const statuses = status?.statuses;
+      const failed = status?.failed;
+      const succeededResults = status?.results?.succeeded;
+      const failedResults = status?.results?.failed;
+      if (
+        Array.isArray(statuses) && statuses.length > 0 &&
+        Array.isArray(failed) && failed.length === 0 &&
+        Array.isArray(succeededResults) && succeededResults.length === statuses.length &&
+        Array.isArray(failedResults) && failedResults.length === 0 &&
+        statuses.every((entry) => (
+          entry?.installed === true && entry?.mode === "active" && entry?.themeId === themeId
+        ))
+      ) {
+        return true;
+      }
+    } catch {}
+    if (attempt === 0 || (attempt + 1) % 20 === 0) {
+      progress(
+        `确认：仍在等待皮肤生效… ${attempt + 1}/${attempts}（无需点击）`,
+      );
+    }
+    await wait(250);
+  }
+  throw new Error("ephemeral controller 未确认皮肤已应用");
+}
+
+async function spawnWindowsSessionController({ nodePath, args }) {
+  const powershell = windowsPowerShellPath();
+  const identityToken = typeof process.env.HEIGE_WINDOWS_APP_IDENTITY === "string"
+    ? process.env.HEIGE_WINDOWS_APP_IDENTITY
+    : "";
+  const { stdout } = await execFile(powershell, [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    join(repositoryRoot, "scripts", "windows", "start-session-controller.ps1"),
+    "-FilePath",
+    nodePath,
+    "-ArgumentsJson",
+    JSON.stringify(args),
+  ], {
+    env: {
+      ...isolatedWindowsPowerShellEnvironment(),
+      ...(identityToken ? { HEIGE_WINDOWS_APP_IDENTITY: identityToken } : {}),
+    },
+    timeout: 30_000,
+    windowsHide: true,
+  });
+  const text = String(stdout).trim();
+  if (text.length === 0) throw new Error("Windows session controller 未返回 PID");
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (cause) {
+    throw new Error("Windows session controller 返回了无效 JSON", { cause });
+  }
+  if (!Number.isSafeInteger(parsed?.Pid) || parsed.Pid <= 0) {
+    throw new Error("Windows session controller PID 无效");
+  }
+  return parsed;
+}
+
+async function productionRegisterEphemeral({ deps, paths, port, preflight, themeId }) {
+  await ensureProductionState({
+    paths,
+    themeId,
+    process: preflight.process,
+    keepUntilProcessExit: true,
+  });
+  // 注入实际由这个子进程完成，产品必须跟着传下去，否则子进程按 Codex 认窗口、认路径。
+  // Codex 走默认值不加参数：它的 ephemeral 命令行是被真机验收当身份指纹核对的，一字不能动。
+  const profile = productProfile(deps.product);
+  // 没有控制通道的宿主：注完就退。常驻着反而会跟用户抢——用户在主题中心点了新主题，
+  // 页面里换好了，但没有回程通道告诉 controller，下一次健康巡检就把它按 state 里的旧主题改回去。
+  const oneShot = !profile.supportsControlChannel && !(
+    process.platform === "win32" && profile.supportsWindowsRendererControlFallback === true
+  );
+  const controllerArgs = [
+    fileURLToPath(import.meta.url),
+    "controller",
+    "--ephemeral",
+    "--port",
+    String(port),
+    ...(profile.id === DEFAULT_PRODUCT_ID ? [] : ["--app", profile.id]),
+    ...(oneShot ? ["--once"] : []),
+  ];
+  if (process.platform === "win32") {
+    try {
+      await spawnWindowsSessionController({
+        nodePath: process.execPath,
+        args: controllerArgs,
+      });
+    } catch {
+      const child = spawn(process.execPath, controllerArgs, {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      child.unref();
+    }
+  } else {
+    const child = spawn(process.execPath, controllerArgs, {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.unref();
+  }
+  await waitForAppliedSkin({ deps, port, themeId });
+  return { mode: "active" };
+}
+
+function windowsLifecycleWrapperRequired(command) {
+  const wrapper = command;
+  const error = new Error(
+    `Windows 上 ${wrapper} 需要启动或重启 Codex 时，必须使用 ` +
+    `scripts/windows/${wrapper}.ps1 或 scripts/windows/${wrapper}.bat；` +
+    "直接运行 Node CLI 不会调用 macOS 生命周期助手",
+  );
+  error.code = "WINDOWS_LIFECYCLE_WRAPPER_REQUIRED";
+  return error;
+}
+
+function assertDirectLifecycleRestartSupported(platform, command) {
+  if (platform === "win32") throw windowsLifecycleWrapperRequired(command);
+}
+
+async function productionRestartDetached({
+  paths,
+  preflight,
+  launchMode,
+  port,
+  afterLaunch = null,
+  platform = process.platform,
+}) {
+  if (platform === "win32") {
+    const command = launchMode === "native"
+      ? "restore"
+      : (afterLaunch?.command ?? "apply");
+    throw windowsLifecycleWrapperRequired(command);
+  }
+  const actionPath = join(paths.stateRoot, `lifecycle-${randomUUID()}.json`);
+  await writeLifecycleActionFile(actionPath, {
+    process: preflight.process,
+    appPath: preflight.appPath,
+    launchMode,
+    port: launchMode === "cdp" ? port : null,
+    verifyPort: launchMode === "native" ? port : null,
+    afterLaunch: afterLaunch === null
+      ? null
+      : {
+        command: afterLaunch.command,
+        cliPath: fileURLToPath(import.meta.url),
+        nodePath: preflight.nodePath,
+        port,
+        themeId: afterLaunch.themeId,
+        ...(afterLaunch.command === "launcher-apply"
+          ? { launcherVersion: afterLaunch.launcherVersion }
+          : {}),
+      },
+  });
+  return spawnDetachedLifecycle({
+    nodePath: preflight.nodePath,
+    helperPath: join(repositoryRoot, "src", "lifecycle-helper.mjs"),
+    actionPath,
+  });
+}
+
+async function legacyLoaded() {
+  if (typeof process.getuid !== "function") throw new Error("migrate-legacy 只支持 macOS 当前用户");
+  try {
+    await execFile("/bin/launchctl", [
+      "print",
+      `gui/${process.getuid()}/com.heige.codex-skin-watchdog`,
+    ]);
+    return true;
+  } catch (error) {
+    if (error?.code === 3 || error?.code === 113) return false;
+    throw error;
+  }
+}
+
+function sameStudioState(left, right) {
+  if (left === null || right === null || typeof left !== "object" || typeof right !== "object") {
+    return false;
+  }
+  return [
+    "schemaVersion",
+    "persistenceEnabled",
+    "selectedThemeId",
+    "lastNonNativeThemeId",
+    "controlToken",
+    "lastTransitionNonce",
+    "revision",
+  ].every((key) => left[key] === right[key]);
+}
+
+function publicMigrationResult(state, migratedFrom = null) {
+  return {
+    migratedFrom,
+    persistenceEnabled: state.persistenceEnabled,
+  };
+}
+
+function exactMigrationReadyAck(ready, expectedState) {
+  if (
+    ready?.persistenceEnabled !== true ||
+    ready?.revision !== expectedState.revision ||
+    !Number.isSafeInteger(ready?.processIdentity?.pid) ||
+    ready.processIdentity.pid <= 0 ||
+    typeof ready.processIdentity.startedAt !== "string" ||
+    ready.processIdentity.startedAt.length === 0
+  ) {
+    throw new Error("legacy migration did not receive the exact background readiness ACK");
+  }
+  return {
+    persistenceEnabled: true,
+    revision: ready.revision,
+    processIdentity: { ...ready.processIdentity },
+  };
+}
+
+async function recoverLegacyLifecycle({ journalPath, dependencies }) {
+  let coordinator = await dependencies.withStateLease(
+    "cli:migrate-legacy:inspect-recovery",
+    (lease) => dependencies.readCoordinator(journalPath, { lease }),
+  );
+  if (coordinator === null) return { recovered: false };
+
+  if (coordinator.decision === "undecided") {
+    coordinator = await dependencies.withStateLease(
+      "cli:migrate-legacy:decide-rollback",
+      (lease) => dependencies.updateCoordinator(
+        journalPath,
+        coordinator,
+        { decision: "rollback", phase: "rollback-decided" },
+        { lease },
+      ),
+    );
+  }
+
+  const recoveryErrors = [];
+  try {
+    await dependencies.recoverService();
+  } catch (error) {
+    recoveryErrors.push(error);
+  }
+
+  if (coordinator.decision === "rollback") {
+    try {
+      await dependencies.withStateLease(
+        "cli:migrate-legacy:rollback-state",
+        async (lease) => {
+          await dependencies.rollbackState({
+            ...coordinator.stateParticipant,
+            lease,
+          });
+          const restored = await dependencies.readState(
+            coordinator.stateParticipant.statePath,
+          );
+          const before = coordinator.stateParticipant.beforeState;
+          if (
+            (before === null && restored !== null) ||
+            (before !== null && !sameStudioState(restored, before))
+          ) {
+            throw new Error("legacy migration rollback did not restore the exact state precondition");
+          }
+        },
+      );
+    } catch (error) {
+      recoveryErrors.push(error);
+    }
+  } else if (coordinator.decision === "commit") {
+    try {
+      await dependencies.withStateLease(
+        "cli:migrate-legacy:verify-committed-state",
+        async () => {
+          const committed = await dependencies.readState(
+            coordinator.stateParticipant.statePath,
+          );
+          if (!sameStudioState(committed, coordinator.stateParticipant.afterState)) {
+            throw new Error("legacy migration committed state is missing or changed");
+          }
+        },
+      );
+    } catch (error) {
+      recoveryErrors.push(error);
+    }
+  }
+
+  if (recoveryErrors.length > 0) {
+    const error = new AggregateError(
+      recoveryErrors,
+      `legacy migration ${coordinator.decision} recovery did not finish`,
+    );
+    error.code = "LEGACY_MIGRATION_RECOVERY_FAILED";
+    throw error;
+  }
+
+  await dependencies.withStateLease(
+    "cli:migrate-legacy:clear-recovery",
+    async (lease) => {
+      const observed = await dependencies.readCoordinator(journalPath, { lease });
+      if (observed === null || observed.transactionId !== coordinator.transactionId) {
+        throw new Error("legacy migration coordinator changed before recovery cleanup");
+      }
+      await dependencies.clearCoordinator(journalPath, observed, { lease });
+    },
+  );
+  return { recovered: true, decision: coordinator.decision };
+}
+
+export async function migrateLegacyLifecycle({
+  port,
+  statePath,
+  journalPath,
+  legacyThemePath,
+  dependencies,
+}) {
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
+    throw new Error("legacy migration port is invalid");
+  }
+  return dependencies.withCoordinatorLease(async () => {
+    await recoverLegacyLifecycle({ journalPath, dependencies });
+    const existing = await dependencies.readState(statePath);
+    if (existing !== null) return publicMigrationResult(existing);
+
+    const legacyAgentLoaded = await dependencies.legacyLoaded();
+    const transactionId = dependencies.randomUUID();
+    const tokenBytes = dependencies.randomBytes(32);
+    const expectedControlToken = Buffer.from(tokenBytes).toString("base64url");
+    let coordinator = null;
+    let migrated = null;
+    try {
+      let racedState = null;
+      await dependencies.withStateLease(
+        "cli:migrate-legacy:prepare-state",
+        async (lease) => {
+          const beforeState = await dependencies.readState(statePath);
+          if (beforeState !== null) {
+            racedState = beforeState;
+            return;
+          }
+          coordinator = await dependencies.createCoordinator({
+            journalPath,
+            transactionId,
+            lease,
+            stateParticipant: {
+              statePath,
+              beforeState,
+              afterState: null,
+              expectedControlToken,
+            },
+          });
+          migrated = await dependencies.migrateState({
+            statePath,
+            lease,
+            legacyThemePath,
+            legacyAgentLoaded,
+            themeExists: dependencies.themeExists,
+            randomBytes: (size) => {
+              if (size !== 32) throw new Error("legacy migration requested an invalid token size");
+              return Buffer.from(tokenBytes);
+            },
+          });
+          coordinator = await dependencies.updateCoordinator(
+            journalPath,
+            coordinator,
+            {
+              phase: "state-prepared",
+              stateParticipant: {
+                ...coordinator.stateParticipant,
+                afterState: migrated.state,
+              },
+            },
+            { lease },
+          );
+        },
+      );
+      if (racedState !== null) return publicMigrationResult(racedState);
+
+      if (!legacyAgentLoaded) {
+        await dependencies.withStateLease(
+          "cli:migrate-legacy:commit-state-only",
+          async (lease) => {
+            const authoritative = await dependencies.readState(statePath);
+            if (!sameStudioState(authoritative, migrated.state)) {
+              throw new Error("legacy migration state changed before commit");
+            }
+            coordinator = await dependencies.updateCoordinator(
+              journalPath,
+              coordinator,
+              { decision: "commit", phase: "commit-decided" },
+              { lease },
+            );
+          },
+        );
+      } else {
+        const service = await dependencies.migrateService({
+          deferCommit: true,
+          outerTransaction: { journalPath, transactionId },
+        });
+        if (
+          service?.legacyFound !== true ||
+          service?.controllerRegistered !== true ||
+          service?.transaction === null ||
+          typeof service?.transaction !== "object"
+        ) {
+          throw new Error("legacy watchdog changed before its service participant was prepared");
+        }
+        await dependencies.withStateLease(
+          "cli:migrate-legacy:record-service",
+          async (lease) => {
+            coordinator = await dependencies.updateCoordinator(
+              journalPath,
+              coordinator,
+              {
+                phase: "service-prepared",
+                serviceParticipant: service.transaction,
+              },
+              { lease },
+            );
+          },
+        );
+
+        const ready = await dependencies.awaitExactReady({
+          port,
+          expectedState: migrated.state,
+          outerTransaction: { journalPath, transactionId },
+        });
+        const ack = exactMigrationReadyAck(ready, migrated.state);
+
+        await dependencies.withStateLease(
+          "cli:migrate-legacy:decide-commit",
+          async (lease) => {
+            const authoritative = await dependencies.readState(statePath);
+            if (!sameStudioState(authoritative, migrated.state)) {
+              throw new Error("legacy migration state changed after readiness ACK");
+            }
+            coordinator = await dependencies.updateCoordinator(
+              journalPath,
+              coordinator,
+              { ack, phase: "ready-acked" },
+              { lease },
+            );
+            if (!await dependencies.verifyAckIdentity(ack.processIdentity)) {
+              throw new Error("legacy migration controller ACK changed before commit");
+            }
+            coordinator = await dependencies.updateCoordinator(
+              journalPath,
+              coordinator,
+              { decision: "commit", phase: "commit-decided" },
+              { lease },
+            );
+          },
+        );
+        await dependencies.finalizeService(service.transaction);
+      }
+
+      await dependencies.withStateLease(
+        "cli:migrate-legacy:clear-commit",
+        async (lease) => dependencies.clearCoordinator(journalPath, coordinator, { lease }),
+      );
+      return publicMigrationResult(migrated.state, migrated.migratedFrom);
+    } catch (primaryError) {
+      if (primaryError?.simulatedHardCrash === true) throw primaryError;
+      if (coordinator === null) throw primaryError;
+      const recoveryErrors = [];
+      try {
+        await recoverLegacyLifecycle({ journalPath, dependencies });
+      } catch (error) {
+        recoveryErrors.push(error);
+      }
+      if (recoveryErrors.length === 0) throw primaryError;
+      const error = new AggregateError(
+        [primaryError, ...recoveryErrors],
+        `legacy migration failed and rollback did not finish: ${primaryError.message}`,
+      );
+      error.code = "LEGACY_MIGRATION_ROLLBACK_FAILED";
+      throw error;
+    }
+  });
+}
+
+async function productionMigrateLegacy({ deps, paths, roots, port }) {
+  const stateLock = await productionLockOptions(paths);
+  const coordinatorStateRoot = join(paths.stateRoot, "legacy-migration-operation");
+  const coordinatorLock = {
+    ...stateLock,
+    stateRoot: coordinatorStateRoot,
+    lockPath: join(coordinatorStateRoot, "operation.lock"),
+  };
+  const journalPath = legacyMigrationJournalPath(paths.stateRoot);
+  const dependencies = {
+    randomBytes,
+    randomUUID,
+    legacyLoaded,
+    readState: readStudioState,
+    withCoordinatorLease: (action) => withOperationLock({
+      ...coordinatorLock,
+      operation: "cli:migrate-legacy-coordinator",
+    }, action),
+    withStateLease: (operation, action) => withOperationLock({
+      ...stateLock,
+      operation,
+    }, action),
+    readCoordinator: readLegacyMigrationCoordinator,
+    createCoordinator: createLegacyMigrationCoordinator,
+    updateCoordinator: updateLegacyMigrationCoordinator,
+    clearCoordinator: clearLegacyMigrationCoordinator,
+    migrateState: migrateLegacyState,
+    rollbackState: rollbackLegacyStateMigration,
+    migrateService: migrateLegacyWatchdog,
+    finalizeService: finalizeLegacyWatchdogMigration,
+    recoverService: recoverLegacyWatchdogMigration,
+    verifyAckIdentity: async (expected) => {
+      const observed = await inspectLaunchAgentProcessIdentity();
+      return observed?.pid === expected?.pid && observed?.startedAt === expected?.startedAt;
+    },
+    themeExists: async (themeId) => {
+      const themes = await deps.listThemes({ roots });
+      return themes.some((theme) => theme.id === themeId);
+    },
+    awaitExactReady: async ({ port: selectedPort, expectedState, outerTransaction }) => {
+      const controller = await lifecycleController(deps, {
+        port: selectedPort,
+        preferStored: true,
+        migrationAuthorization: {
+          role: "migration-ready-foreground",
+          transactionId: outerTransaction.transactionId,
+          journalPath: outerTransaction.journalPath,
+          expectedRevision: expectedState.revision,
+          expectedControlToken: expectedState.controlToken,
+        },
+      });
+      return withStoppedController(controller, () => controller.setPersistence({
+        expectedRevision: expectedState.revision,
+        enabled: true,
+        includeProcessIdentity: true,
+      }));
+    },
+  };
+  return migrateLegacyLifecycle({
+    port,
+    statePath: paths.statePath,
+    journalPath,
+    legacyThemePath: join(process.env.HOME, ".codex", "heige-codex-skin-persist", "theme"),
+    dependencies,
+  });
+}
+
+export async function offlineDisablePersistence({
+  statePath,
+  sessionPath,
+  transitionPath,
+  expectedRevision,
+  dependencies,
+}) {
+  if (
+    expectedRevision !== undefined &&
+    (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0)
+  ) {
+    throw new Error("expectedRevision must be a non-negative safe integer");
+  }
+  return dependencies.withStateLease(
+    "cli:disable-persistence-offline",
+    async (lease) => {
+      await dependencies.recoverTransition({
+        statePath,
+        sessionPath,
+        transitionPath,
+        lease,
+        currentProcess: null,
+      });
+      let state = await dependencies.readState(statePath);
+      // 装了但从未 apply 过时本来就是原生外观，还原应当幂等成功并落下「已关闭」，
+      // 不该反过来要求用户先去 apply 才能还原。
+      if (state === null) state = await dependencies.createDisabledState(statePath, { lease });
+      if (state.persistenceEnabled === true) {
+        const revision = expectedRevision ?? state.revision;
+        state = await dependencies.compareState(statePath, {
+          lease,
+          expectedRevision: revision,
+          mutate: (current) => ({
+            ...current,
+            persistenceEnabled: false,
+            lastTransitionNonce: dependencies.newTransitionNonce(),
+          }),
+        });
+      }
+      await dependencies.writeSession(sessionPath, {
+        schemaVersion: 1,
+        mode: "native",
+        process: null,
+        activeThemeId: null,
+        keepUntilProcessExit: false,
+      }, { lease });
+      await dependencies.unregisterBackground();
+      const background = await dependencies.inspectBackground();
+      if (background?.registered !== false) {
+        throw new Error("常驻已关闭，但后台控制器仍保持注册");
+      }
+      return {
+        persistenceEnabled: false,
+        revision: state.revision,
+      };
+    },
+  );
+}
+
+async function productionUnregisterBackground({
+  paths,
+  platform,
+  port,
+  taskName = WINDOWS_PRODUCTION_TASK,
+}) {
+  if (platform === "darwin") {
+    await unregisterControllerAgent();
+  } else if (platform === "win32") {
+    await runWindowsControllerAction({
+      action: "unregister",
+      taskName,
+      port,
+      stateRoot: paths.stateRoot,
+    });
+  } else {
+    throw new Error(`不支持的平台：${platform}`);
+  }
+  await removeBackgroundStartRequest({ stateRoot: paths.stateRoot }).catch((error) => {
+    if (error?.code !== "ENOENT") throw error;
+  });
+  await removeBackgroundHandshake({ stateRoot: paths.stateRoot }).catch((error) => {
+    if (error?.code !== "ENOENT") throw error;
+  });
+}
+
+async function productionInspectBackground({
+  platform,
+  paths,
+  port,
+  taskName = WINDOWS_PRODUCTION_TASK,
+}) {
+  if (platform === "darwin") {
+    const value = await inspectLaunchAgent();
+    return {
+      ...value,
+      registered: value.plistExists === true && value.loaded === true,
+    };
+  }
+  if (platform === "win32") {
+    const value = await runWindowsControllerAction({
+      action: "status",
+      taskName,
+      port,
+      stateRoot: paths.stateRoot,
+    });
+    return { ...value, ...normalizeWindowsBackgroundStatus(value) };
+  }
+  throw new Error(`不支持的平台：${platform}`);
+}
+
+async function productionOfflineDisable({ paths, platform, port, expectedRevision, taskName }) {
+  const stateLock = await productionLockOptions(paths, platform);
+  return offlineDisablePersistence({
+    statePath: paths.statePath,
+    sessionPath: paths.sessionPath,
+    transitionPath: paths.transitionPath,
+    expectedRevision,
+    dependencies: {
+      withStateLease: (operation, action) => withProductionStateLease({
+        paths,
+        options: stateLock,
+        operation,
+      }, action),
+      readState: readStudioState,
+      createDisabledState: (path, { lease }) => writeStudioState(path, createDefaultStudioState({
+        themeId: DEFAULT_THEME_ID,
+        token: randomBytes(32).toString("base64url"),
+      }), { lease }),
+      compareState: compareAndUpdateStudioState,
+      writeSession: writeSessionState,
+      recoverTransition: recoverStateTransition,
+      newTransitionNonce: randomUUID,
+      unregisterBackground: () => productionUnregisterBackground({ paths, platform, port, taskName }),
+      inspectBackground: () => productionInspectBackground({ paths, platform, port, taskName }),
+    },
+  });
+}
+
+async function productionChooseThemeInputs() {
+  try {
+    const image = await execFile("/usr/bin/osascript", [
+      "-e",
+      'POSIX path of (choose file with prompt "选择一张皮肤主图" of type {"public.image"})',
+    ]);
+    const name = await execFile("/usr/bin/osascript", [
+      "-e",
+      'text returned of (display dialog "给皮肤起个名字" default answer "我的 Codex 皮肤")',
+    ]);
+    return {
+      imagePath: image.stdout.trim(),
+      name: name.stdout.trim(),
+    };
+  } catch (error) {
+    if (/\(-128\)|User canceled/i.test(String(error?.stderr ?? error?.message ?? ""))) return null;
+    throw error;
+  }
+}
+
+function defaults(overrides, {
+  paths: selectedPaths,
+  platform = process.platform,
+  taskName,
+  installAuthorization = null,
+  product = undefined,
+} = {}) {
+  const profile = productProfile(product);
+  const effectiveTaskName = platform === "win32"
+    ? (taskName ?? windowsProductionTask(profile.id))
+    : taskName;
+  const paths = overrides.paths ?? selectedPaths ?? resolveStudioPaths({ platform, product: profile.id });
+  // 注入层的产品在这里一次性绑定，各命令不用自己传，测试注入的 overrides 仍然优先
+  const boundToProduct = (fn) => (input) => fn({ ...input, product: profile.id });
+  const bundledThemesRoot = join(repositoryRoot, "themes");
+  const roots = [bundledThemesRoot, paths.userThemesRoot];
+  const launcherLogger = createStudioLogger({
+    path: join(paths.stateRoot, "launcher.log"),
+    maxBytes: 256 * 1024,
+    backups: 2,
+  });
+  const queryWindowsRuntime = overrides.queryWindowsRuntime ?? ((input) =>
+    queryWindowsRuntimeSnapshot({
+      ...input,
+      product: profile.id,
+      powershellPath: windowsPowerShellPath(),
+      commonScriptPath: join(repositoryRoot, "scripts", "windows", "lib", "common.ps1"),
+    }));
+  const base = {
+    bundledThemesRoot,
+    userThemesRoot: paths.userThemesRoot,
+    paths,
+    platform,
+    roots,
+    home: process.env.HOME,
+    nodeVersion: process.versions.node,
+    loadTheme,
+    listThemes,
+    resolveAndLoadTheme,
+    createSingleImageTheme,
+    installPet,
+    product: profile.id,
+    applySkin: boundToProduct(applySkin),
+    removeSkin: boundToProduct(removeSkin),
+    skinStatus: boundToProduct(skinStatus),
+    deliverUpdateCheckResult: boundToProduct(deliverUpdateCheckResult),
+    deliverThemeSelectionResult: boundToProduct(deliverThemeSelectionResult),
+    readCurrentPackageVersion,
+    createCachedUpdateChecker,
+    readState: () => readStudioState(paths.statePath),
+    preflightLifecycle: (input) => productionPreflight({
+      ...input,
+      platform,
+      product: profile.id,
+      dependencies: { queryWindowsRuntime },
+    }),
+    queryWindowsRuntime,
+    chooseThemeInputs: productionChooseThemeInputs,
+    ensureLauncherOperationLock: (input) => ensureMacosLauncherOperationLock({
+      ...input,
+      paths,
+    }),
+    logLauncherError: (error) => launcherLogger.error("launcher.apply", error),
+    logLauncherRecovery: (result) => launcherLogger.warn(
+      "launcher.lock-recovered",
+      `backup=${result.backupPath ?? "unknown"} themes=${result.restoredThemes ?? 0}`,
+    ),
+  };
+  const merged = { ...base, ...overrides };
+  merged.roots = [merged.bundledThemesRoot, merged.userThemesRoot];
+  merged.ensureState = overrides.ensureState ?? (overrides.readState
+    ? async () => overrides.readState()
+    : ({ themeId, preflight, keepUntilProcessExit = true }) => ensureProductionState({
+      paths: merged.paths,
+      themeId,
+      process: preflight?.process,
+      keepUntilProcessExit,
+    }));
+  merged.registerEphemeralController = overrides.registerEphemeralController ?? ((input) =>
+    productionRegisterEphemeral({ ...input, deps: merged, paths: merged.paths }));
+  merged.createController = overrides.createController ?? ((input) =>
+    productionController({
+      ...input,
+      deps: merged,
+      paths: merged.paths,
+      roots: merged.roots,
+      taskName: input.taskName ?? effectiveTaskName,
+      installAuthorization: input.installAuthorization ?? installAuthorization,
+    }));
+  merged.runController = overrides.runController ?? (overrides.createController
+    ? (controller) => controller.start()
+    : ((controller, options) => runControllerProcess(controller, {
+      ...options,
+      paths: merged.paths,
+    })));
+  merged.restartDetached = overrides.restartDetached ?? ((input) =>
+    productionRestartDetached({ ...input, paths: merged.paths, platform }));
+  merged.offlineDisablePersistence = overrides.offlineDisablePersistence ?? ((input) =>
+    productionOfflineDisable({
+      ...input,
+      paths: merged.paths,
+      platform,
+      taskName: effectiveTaskName,
+    }));
+  merged.migrateLegacy = overrides.migrateLegacy ?? ((input) =>
+    productionMigrateLegacy({ ...input, deps: merged, paths: merged.paths, roots: merged.roots }));
+  return merged;
+}
+
+async function lifecycleController(deps, input) {
+  const controller = await deps.createController(input);
+  if (!controller || typeof controller !== "object") throw new Error("controller 创建失败");
+  return controller;
+}
+
+async function preflightWithNativeFallback(deps, input) {
+  try {
+    return {
+      preflight: await deps.preflightLifecycle({ ...input, requirePort: true }),
+      restartRequired: false,
+    };
+  } catch (error) {
+    if (error?.code !== "CDP_NOT_OWNED") throw error;
+    return {
+      preflight: await deps.preflightLifecycle({ ...input, requirePort: false }),
+      restartRequired: true,
+    };
+  }
+}
+
+async function applySelectedTheme({
+  deps,
+  roots,
+  command,
+  port,
+  preferStored,
+  themeId,
+  forceRestart = false,
+  launcherVersion = null,
+}) {
+  const bundle = await themeBundle({ deps, roots, themeId });
+  const fallback = await preflightWithNativeFallback(deps, {
+    command,
+    port,
+    themeId,
+  });
+  const preflight = fallback.preflight;
+  // 强制重启是合成器卡死（整窗低帧率）等疑难场景的恢复入口：
+  // 健康 CDP 会话下 apply 幂等不重启进程，救不了这种病，必须先退出再拉起。
+  const restartRequired = forceRestart || fallback.restartRequired;
+  const before = await deps.readState();
+  if (restartRequired) {
+    assertDirectLifecycleRestartSupported(deps.platform, command);
+    const continuationCommand = command === "launcher-apply" || command === "launcher-repair"
+      ? "launcher-apply"
+      : "apply";
+    const queued = await deps.restartDetached({
+      launchMode: "cdp",
+      port,
+      preflight,
+      themeId,
+      afterLaunch: {
+        command: continuationCommand,
+        themeId,
+        ...(continuationCommand === "launcher-apply" ? { launcherVersion } : {}),
+      },
+    });
+    return {
+      mode: "restarting",
+      persistenceEnabled: before?.persistenceEnabled === true,
+      queued: queued?.queued === true,
+    };
+  }
+  const applied = await deps.registerEphemeralController({
+    loadedTheme: bundle.loadedTheme,
+    themes: bundle.menuThemes,
+    port,
+    preferStored,
+    preflight,
+    themeId,
+  });
+  return {
+    ...applied,
+    persistenceEnabled: before?.persistenceEnabled === true,
+  };
+}
+
+async function withStoppedController(controller, action) {
+  try {
+    return await action();
+  } finally {
+    await controller.stop?.();
+  }
+}
+
+export async function runCli(argv, overrides = {}) {
+  const { args, command, positionals } = parseInvocation(argv);
+  if (!WORKBUDDY_PUBLIC_COMMANDS.has(command)) {
+    throw new Error(`此 WorkBuddy 专用发行版不提供命令：${command}`);
+  }
+  const productId = productFrom(args.app);
+  const profile = productProfile(productId);
+  if (args.port !== undefined && Number(args.port) !== 9342) {
+    throw new Error("此发行版固定使用 WorkBuddy 端口 9342；不会使用 9341 或其他端口");
+  }
+  // 常驻的开关按钮由 renderer 回调控制服务器完成，而控制服务器的来源校验只认 app://-。
+  // WorkBuddy 的 renderer 是 file://，跨源请求带的是 Origin: null，放行它等于削弱 CSRF 防线，
+  // 所以这一版明确拒绝常驻，而不是悄悄降级。
+  // controller 不在拒绝之列：apply 的注入本身就是靠 ephemeral controller 干的，
+  // 它只是不起控制服务（见 products.mjs 的 supportsControlChannel）。
+  const platformSupportsRendererFallback =
+    (overrides.platform ?? process.platform) === "win32" &&
+    profile.supportsWindowsRendererControlFallback === true;
+  if (!profile.supportsControlChannel && !platformSupportsRendererFallback && command === "set-persistence") {
+    throw new Error(`${profile.label} 这一版只支持一次性皮肤（apply / enable-skin / restore），暂不支持常驻`);
+  }
+  const selectedControllerPlatform = command === "controller"
+    ? controllerPlatform(args.platform)
+    : (overrides.platform ?? process.platform);
+  // 安装授权只经 stdin 管道传递（--install-authorization-stdin），
+  // 不再走环境变量：同用户进程可用 ps eww / proc_pidinfo 读到 env。
+  const installAuthorization = command === "controller"
+    ? null
+    : parseMacosInstallAuthorization(
+      args["install-authorization-stdin"] === true ? readFileSync(0, "utf8") : undefined,
+    );
+  if (
+    installAuthorization !== null &&
+    (
+      selectedControllerPlatform !== "darwin" ||
+      command !== "set-persistence" ||
+      positionals[0] !== "true"
+    )
+  ) {
+    throw new Error("macOS install authorization is restricted to set-persistence true");
+  }
+  const testContext = command === "controller"
+    ? null
+    : windowsCliTestContext(selectedControllerPlatform);
+  const selectedTaskName = command === "controller"
+    ? args["task-name"]
+    : testContext?.taskName;
+  const selectedBackgroundIdentity = command === "controller"
+    ? controllerBackgroundIdentity(selectedControllerPlatform, selectedTaskName, productId)
+    : undefined;
+  const selectedPaths = command === "controller"
+    ? controllerPaths({
+      platform: selectedControllerPlatform,
+      stateDirectory: args["state-directory"],
+      taskName: selectedTaskName,
+      product: productId,
+    })
+    : testContext?.paths;
+  const deps = defaults(overrides, {
+    paths: selectedPaths,
+    platform: selectedControllerPlatform,
+    taskName: selectedTaskName,
+    installAuthorization,
+    product: productId,
+  });
+  if (command === "help") {
+    return {
+      platform: deps.platform,
+      lifecycleContract: "Windows WorkBuddy only; use scripts/windows/*.bat. Port 9342 is mandatory.",
+      commands: [
+        "list",
+        "create --image PATH --name NAME",
+        "customize [--image PATH --name NAME]",
+        "apply [--theme ID] [--port 9342]",
+        "enable-skin [--theme ID] [--port 9342]",
+        "set-persistence false [--revision N]",
+        "pause",
+        "resume",
+        "restore",
+        "controller",
+        "status",
+        "doctor",
+      ],
+    };
+  }
+  assertNodeVersion(deps.nodeVersion);
+  const roots = deps.roots;
+
+  if (command === "launcher-state") {
+    const [discovery, studioState, themes] = await Promise.all([
+      (deps.discoverCodex ?? discoverCodex)({ product: productId }),
+      deps.readState(),
+      deps.listThemes({ roots }),
+    ]);
+    return buildLauncherPanelState({
+      profile,
+      discovery,
+      studioState,
+      themes,
+      defaultThemeId: DEFAULT_THEME_ID,
+    });
+  }
+  if (command === "list") return deps.listThemes({ roots });
+  if (command === "create") {
+    if (!args.image) throw new Error("create 需要 --image");
+    if (!args.name) throw new Error("create 需要 --name");
+    return deps.createSingleImageTheme({
+      imagePath: args.image,
+      name: args.name,
+      storeRoot: deps.userThemesRoot,
+    });
+  }
+  if (command === "customize") {
+    if (Boolean(args.image) !== Boolean(args.name)) {
+      throw new Error("customize 的 --image 和 --name 必须同时提供");
+    }
+    const input = args.image
+      ? { imagePath: args.image, name: args.name }
+      : await deps.chooseThemeInputs();
+    if (input === null) return { cancelled: true };
+    const created = await deps.createSingleImageTheme({
+      imagePath: input.imagePath,
+      name: input.name,
+      storeRoot: deps.userThemesRoot,
+    });
+    if (typeof created?.id !== "string") throw new Error("新主题未返回有效 ID");
+    const applied = await applySelectedTheme({
+      deps,
+      roots,
+      command: "customize",
+      port: portFrom(args.port, profile.defaultCdpPort),
+      preferStored: false,
+      themeId: created.id,
+    });
+    return { created, applied };
+  }
+  if (command === "apply") {
+    const preferStored = Boolean(args["prefer-stored"]);
+    const stored = preferStored && args.theme === undefined
+      ? await deps.readState()
+      : null;
+    const themeId = args.theme ?? stored?.lastNonNativeThemeId ?? DEFAULT_THEME_ID;
+    const port = portFrom(args.port, profile.defaultCdpPort);
+    return applySelectedTheme({
+      deps,
+      roots,
+      command,
+      port,
+      preferStored,
+      themeId,
+      forceRestart: Boolean(args.restart),
+    });
+  }
+  if (["launcher-apply", "launcher-close", "launcher-repair"].includes(command)) {
+    try {
+      if (selectedControllerPlatform !== "darwin") {
+        throw new Error(`${command} 只支持 macOS 桌面产品`);
+      }
+      if (typeof args["launcher-version"] !== "string") {
+        throw new Error(`${command} 缺少 --launcher-version`);
+      }
+      const currentVersion = await deps.readCurrentPackageVersion();
+      if (args["launcher-version"] !== currentVersion) {
+        throw new Error(
+          `启动器版本 ${args["launcher-version"]} 与稳定运行时 ${currentVersion} 不匹配，请重新运行安装器`,
+        );
+      }
+      const port = portFrom(args.port, profile.defaultCdpPort);
+      const lockHealth = await deps.ensureLauncherOperationLock({ port });
+      if (lockHealth?.recovered === true) {
+        await deps.logLauncherRecovery(lockHealth).catch(() => false);
+      }
+      if (command === "launcher-close") {
+        let preflight;
+        try {
+          preflight = await deps.preflightLifecycle({ command, port, requirePort: true });
+        } catch (error) {
+          if (error?.code === "CDP_NOT_OWNED") return { mode: "closed" };
+          throw error;
+        }
+        const controller = await lifecycleController(deps, { port, preflight });
+        return await withStoppedController(controller, () => controller.pause());
+      }
+      const stored = args.theme === undefined ? await deps.readState() : null;
+      const themeId = args.theme ?? stored?.lastNonNativeThemeId ?? DEFAULT_THEME_ID;
+      return await applySelectedTheme({
+        deps,
+        roots,
+        command,
+        port,
+        preferStored: true,
+        themeId,
+        forceRestart: command === "launcher-repair",
+        launcherVersion: currentVersion,
+      });
+    } catch (error) {
+      await deps.logLauncherError(error).catch(() => false);
+      throw error;
+    }
+  }
+  if (command === "enable-skin") {
+    const stored = args.theme === undefined ? await deps.readState() : null;
+    const themeId = args.theme ?? stored?.lastNonNativeThemeId ?? DEFAULT_THEME_ID;
+    const port = portFrom(args.port, profile.defaultCdpPort);
+    return applySelectedTheme({
+      deps,
+      roots,
+      command,
+      port,
+      preferStored: args.theme === undefined,
+      themeId,
+    });
+  }
+  if (command === "set-persistence") {
+    const enabled = exactBoolean(positionals[0]);
+    if (enabled && installAuthorization === null) {
+      throw new Error("常驻只能在 Codex 顶部菜单的「皮肤常驻」开关中开启；此命令仅支持 false");
+    }
+    const port = portFrom(args.port, profile.defaultCdpPort);
+    const state = await deps.readState();
+    if (state === null) {
+      if (enabled) throw new Error("状态文件不存在，请先运行 apply");
+      // 从未 apply 过的安装本来就是原生外观：关闭常驻应当幂等落盘，
+      // 而不是要求用户先 apply 一次才准关闭。Windows 的还原流程走的正是这条路径。
+      return deps.offlineDisablePersistence({ port });
+    }
+    const expectedRevision = revisionFrom(args.revision, state.revision);
+    const { preflight, restartRequired } = enabled
+      ? {
+        preflight: await deps.preflightLifecycle({ command, port, requirePort: true }),
+        restartRequired: false,
+      }
+      : await preflightWithNativeFallback(deps, { command, port });
+    if (restartRequired) {
+      return deps.offlineDisablePersistence({ port, expectedRevision });
+    }
+    const controller = await lifecycleController(deps, { port, preflight });
+    return withStoppedController(controller, () => controller.setPersistence({
+      expectedRevision,
+      enabled,
+      includeProcessIdentity: installAuthorization !== null,
+    }));
+  }
+  if (command === "restore") {
+    const port = portFrom(args.port, profile.defaultCdpPort);
+    const { preflight, restartRequired } = await preflightWithNativeFallback(deps, {
+      command,
+      port,
+    });
+    if (restartRequired) {
+      await deps.offlineDisablePersistence({ port });
+      return {
+        mode: preflight.process === null ? "closed" : "native",
+        persistenceEnabled: false,
+      };
+    }
+    assertDirectLifecycleRestartSupported(deps.platform, command);
+    const controller = await lifecycleController(deps, { port, preflight });
+    const result = await withStoppedController(controller, () => controller.restore());
+    await deps.restartDetached({ launchMode: "native", port, preflight });
+    return result;
+  }
+  if (command === "pause" || command === "resume") {
+    const port = portFrom(args.port, profile.defaultCdpPort);
+    const preflight = await deps.preflightLifecycle({ command, port, requirePort: true });
+    const controller = await lifecycleController(deps, { port, preflight });
+    const result = await withStoppedController(controller, () => controller[command]());
+    return result;
+  }
+  if (command === "controller") {
+    if (args.background && args.ephemeral) {
+      throw new Error("controller cannot be both background and ephemeral");
+    }
+    const port = portFrom(args.port, profile.defaultCdpPort);
+    const startupHandshake = null;
+    const ephemeralLease = args.ephemeral
+      ? await acquireEphemeralControllerLease(deps.paths, selectedControllerPlatform)
+      : undefined;
+    if (args.ephemeral && ephemeralLease === null) {
+      return { action: "already-running", mode: "active" };
+    }
+    try {
+      const controller = await lifecycleController(deps, {
+        background: Boolean(args.background),
+        ephemeral: Boolean(args.ephemeral),
+        platform: selectedControllerPlatform,
+        port,
+        taskName: selectedTaskName,
+        startupHandshake,
+      });
+      const result = await deps.runController(controller, {
+        backgroundRuntime: args.background
+          ? {
+            platform: selectedControllerPlatform,
+            backgroundIdentity: selectedBackgroundIdentity,
+          }
+          : null,
+        ephemeralRuntime: Boolean(args.ephemeral),
+        once: Boolean(args.once),
+        startupHandshake,
+      });
+      if (result?.action === "error" || result?.mode === "error") {
+        throw new Error("控制器启动或巡检失败");
+      }
+      return result;
+    } finally {
+      await ephemeralLease?.release();
+    }
+  }
+  if (command === "status") return deps.skinStatus({ port: portFrom(args.port, profile.defaultCdpPort) });
+  if (command === "install-pet") {
+    return deps.installPet({
+      sourceRoot: args.source ?? join(repositoryRoot, "custom-pet/not-bundled"),
+      home: deps.home,
+    });
+  }
+  if (command === "doctor") {
+    const selectedPort = portFrom(args.port, profile.defaultCdpPort);
+    if (selectedControllerPlatform === "win32") {
+      const snapshot = validateWindowsRuntimeSnapshot(
+        await deps.queryWindowsRuntime({ port: selectedPort }),
+      );
+      const offline = snapshot.listeners.length === 0
+        ? classifyWindowsPreflightSnapshot(snapshot, {
+          port: selectedPort,
+          requirePort: false,
+        })
+        : null;
+      const exact = snapshot.listeners.length === 0
+        ? null
+        : classifyWindowsPreflightSnapshot(snapshot, {
+          port: selectedPort,
+          requirePort: true,
+        });
+      const processRunning = (offline?.process ?? exact?.process ?? null) !== null;
+      const usingRuntimeFixture = deps.env?.HEIGE_TEST_WINDOWS_RUNTIME_FIXTURE !== undefined
+        || process.env.HEIGE_TEST_WINDOWS_RUNTIME_FIXTURE !== undefined;
+      let processHasDebugFlag = exact !== null;
+      let portOpen = exact !== null;
+      let portBrowser = null;
+      let appVersion = null;
+      if (!usingRuntimeFixture || typeof deps.runtimeDiagnostics === "function") {
+        const runtimeDiag = await (deps.runtimeDiagnostics ?? runtimeDiagnostics)({
+          platform: "win32",
+          port: selectedPort,
+          product: productId,
+          env: deps.env,
+          exec: deps.exec,
+          fetchImpl: deps.fetchImpl,
+        });
+        processHasDebugFlag = runtimeDiag.processHasDebugFlag;
+        portOpen = runtimeDiag.portOpen;
+        portBrowser = runtimeDiag.portBrowser;
+        appVersion = runtimeDiag.appVersion;
+      }
+      const store = snapshot.app.kind === "StoreAumid" || snapshot.app.kind === "StoreAlias";
+      let loopbackExempt = null;
+      if (store && typeof snapshot.app.aumid === "string") {
+        const bang = snapshot.app.aumid.lastIndexOf("!");
+        const packageFamilyName = bang > 0 ? snapshot.app.aumid.slice(0, bang) : snapshot.app.aumid;
+        loopbackExempt = await (deps.queryWindowsLoopbackExempt ?? queryWindowsLoopbackExempt)({
+          packageFamilyName,
+          env: deps.env ?? process.env,
+        });
+      }
+      const loopbackIsolated = Boolean(
+        store && processRunning && processHasDebugFlag && !portOpen && loopbackExempt !== true,
+      );
+      const runtime = {
+        appVersion,
+        processRunning,
+        processHasDebugFlag,
+        portOpen,
+        portBrowser,
+        loopbackExempt,
+        loopbackIsolated,
+        listenerCount: snapshot.listeners.length,
+      };
+      return {
+        platform: "win32",
+        app: snapshot.app.launchTarget,
+        appFound: true,
+        candidates: [snapshot.app.launchTarget],
+        bundledNode: snapshot.nodePath,
+        bundledNodeFound: true,
+        cdpPort: selectedPort,
+        ...runtime,
+        diagnosis: classifyInjection(runtime),
+      };
+    }
+    const discovery = await (deps.discoverCodex ?? discoverCodex)({ product: productId });
+    const runtime = await (deps.runtimeDiagnostics ?? runtimeDiagnostics)({
+      appPath: discovery.app,
+      port: selectedPort,
+      product: productId,
+    });
+    return {
+      ...discovery,
+      product: productId,
+      productName: profile.appDisplayName,
+      cdpPort: selectedPort,
+      ...runtime,
+      diagnosis: classifyInjection(runtime, { product: productId }),
+    };
+  }
+  throw new Error(`未知命令：${command}`);
+}
+
+// argv[1] 保留符号链接原路径，import.meta.url 是 realpath。先解真实路径再比较。
+function isMainEntry() {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  let real = entry;
+  try {
+    real = realpathSync(entry);
+  } catch {}
+  return pathToFileURL(real).href === import.meta.url;
+}
+
+if (isMainEntry()) {
+  runCli(process.argv.slice(2))
+    .then((result) => process.stdout.write(`${JSON.stringify(result, null, 2)}\n`))
+    .catch((error) => {
+      process.stderr.write(`WorkBuddy Loopback Skin：${error.message}\n`);
+      process.exitCode = 1;
+    });
+}
